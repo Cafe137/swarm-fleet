@@ -1,0 +1,5 @@
+{"ev":"start","mode":"peer","network_id":1,"peer_limit":30,"pid":3764,"t":1,"version":"0.0.0"}
+{"dial_failures":0,"ev":"peers","peers":25,"t":5003}
+{"dial_failures":5,"ev":"peers","peers":30,"t":10005}
+{"dial_failures":5,"ev":"peers","peers":30,"t":11003}
+{"bytes":0,"ev":"summary","peers":30,"segments":0,"t":11003,"wall_s":11.001912417}

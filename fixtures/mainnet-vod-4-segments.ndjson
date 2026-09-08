@@ -1,0 +1,9 @@
+{"ev":"start","mode":"vod","network_id":1,"owner":"6F2728386F8a47ef5EBe323721188e630Ff0FdE9","peer_limit":200,"pid":3734,"t":1,"topic":"f3ee0319-469e-4c2c-bb83-edcb06deda33","version":"0.0.0"}
+{"dial_failures":0,"ev":"peers","peers":25,"t":772}
+{"ev":"joined","feed_index":3888,"join_ms":7542,"runway_s":7774.4666599999955,"start_sequence":0,"t":8314,"window":3888}
+{"dial_failures":7,"ev":"peers","peers":198,"t":8679}
+{"attempts":1,"buffered_s":2.0,"bytes":632620,"ev":"segment","fetch_ms":365.23991700000005,"peers":198,"segment_s":2.0,"sequence":0,"stall_s":0.0,"stalled":false,"t":8679}
+{"attempts":1,"buffered_s":3.66650575,"bytes":664204,"ev":"segment","fetch_ms":333.49424999999997,"peers":199,"segment_s":2.0,"sequence":1,"stall_s":0.0,"stalled":false,"t":9013}
+{"attempts":1,"buffered_s":5.329314666,"bytes":664580,"ev":"segment","fetch_ms":337.191084,"peers":200,"segment_s":2.0,"sequence":2,"stall_s":0.0,"stalled":false,"t":9350}
+{"attempts":1,"buffered_s":6.998852541,"bytes":664204,"ev":"segment","fetch_ms":330.462125,"peers":200,"segment_s":2.0,"sequence":3,"stall_s":0.0,"stalled":false,"t":9680}
+{"body_failures":0,"bytes":2625608,"ev":"summary","feed_index":3888,"fetch_ms_p50":337.191084,"fetch_ms_p90":365.23991700000005,"fetch_ms_p99":365.23991700000005,"finalized":true,"gaps":0,"media_s":8.0,"peers":200,"segments":4,"skipped":0,"stalled_s":0.0,"stalls":0,"t":9680,"wall_s":1.366517666}
