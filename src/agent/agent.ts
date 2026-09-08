@@ -363,6 +363,12 @@ export class FleetAgent {
       },
       viewers: viewerSamples,
     });
+    // `bootstrapping` decays with the wall clock — a viewer stops counting once
+    // it joins or once the bootstrap timeout passes — so a state reported only
+    // when a viewer starts or exits goes stale the moment launching finishes,
+    // and the live view showed a fleet that had long since joined as still
+    // bootstrapping. The sampler ticks anyway; report from it.
+    this.reportState();
   }
 
   // ------------------------------------------------------------- lifecycle

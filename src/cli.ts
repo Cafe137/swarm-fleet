@@ -16,7 +16,7 @@ import { Controller, type RunResult } from './controller.js';
 import { machineInfo, preflight } from './agent/preflight.js';
 import { FleetAgent } from './agent/agent.js';
 import { renderReport } from './report/markdown.js';
-import { ConsoleView } from './report/console.js';
+import type { ConsoleView } from './report/console.js';
 import { buildSummary, type RunSummary } from './report/summary.js';
 import { createRunDir, runId, writeJson } from './run-dir.js';
 import { AgentTarget, resolveScenario, Scenario } from './scenario.js';
@@ -147,11 +147,15 @@ async function runFleet(args: Args): Promise<number> {
     await writeJson(path.join(dir, 'deploy.json'), deployed.report);
   }
 
-  const view = new ConsoleView();
+  // Loaded here rather than imported: the live view is the controller's, and
+  // the deployed agent runs the same `cli.js` without cli-table3 beside it.
+  const { ConsoleView } = await import('./report/console.js');
+  const view: ConsoleView = new ConsoleView({ durationS: scenario.durationS });
   const quiet = args.has('quiet');
   const controller = new Controller(scenario, id, dir, {
     ...(quiet ? {} : { onSnapshot: (snapshot) => view.render(snapshot) }),
-    onLog: (level, message) => process.stderr.write(`${level}: ${message}\n`),
+    // Through the view, so a log does not land inside the block it redraws.
+    onLog: (level, message) => view.log(`${level}: ${message}`),
   });
 
   process.stderr.write(
@@ -167,7 +171,7 @@ async function runFleet(args: Args): Promise<number> {
       process.exit(130);
     }
     aborting = true;
-    process.stderr.write(`\n${signal}: stopping viewers and writing the report\n`);
+    view.log(`\n${signal}: stopping viewers and writing the report`);
     void controller.abort(signal);
   };
   process.on('SIGINT', () => onSignal('SIGINT'));
@@ -181,6 +185,9 @@ async function runFleet(args: Args): Promise<number> {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   } finally {
+    // Hand the terminal back before anything else prints: the block below the
+    // cursor is finished with, and what follows belongs in the scrollback.
+    view.release();
     // The publisher outlives a failed run only long enough to be told to stop:
     // an ffmpeg left encoding into Swarm is both a cost and a contaminated
     // measurement for whatever runs next.
@@ -195,7 +202,6 @@ async function runFleet(args: Args): Promise<number> {
       );
     }
   }
-  view.release();
 
   const summary = buildSummary(result);
   await writeJson(path.join(dir, 'summary.json'), summary);

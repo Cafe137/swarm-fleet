@@ -177,26 +177,42 @@ leaving the default `local` agent in place.
 
 ## While it runs
 
-The live view redraws one block a second: the fleet's KPIs, and then one line per
-machine.
+The live view redraws one block a second, in place: the fleet's KPIs, and then one
+row per machine.
 
 ```
-  elapsed 84s     viewers 58/60   bootstrapping 2     joined 56
-  degraded 1.7%   stall p95 0.4%  realtime p95 0.61   47.3 Mbps media
-  segments 2914   1839 MB retrieved     guards ok
+  elapsed 1:24/5:00  █████░░░░░░░░░░░░░  viewers 58/60  joined 56  bootstrapping 2
 
-  host              viewers    cpu    load     mem    rx/tx Mbps      sockets  note
-  box-a             20/20      18.4%  2.1/8    9.2%   16.8/0.6        4021
-  box-b             20/20      19.1%  2.3/8    9.4%   17.2/0.6        4018
-  box-c             18/20+2    24.8%  3.9/8    9.1%   14.9/0.5        3702     cpu budget spent
+  ┌──────────┬───────────┬──────────────┬───────────┬──────────┬───────────┬────────┐
+  │ degraded │ stall p95 │ realtime p95 │ media     │ segments │ retrieved │ guards │
+  ├──────────┼───────────┼──────────────┼───────────┼──────────┼───────────┼────────┤
+  │ 1.7%     │ 0.4%      │ 0.61         │ 47.3 Mbps │ 2914     │ 1839 MB   │ ok     │
+  └──────────┴───────────┴──────────────┴───────────┴──────────┴───────────┴────────┘
+
+  ┌───────┬─────────┬─────────┬───────┬───────┬───────┬────────────┬─────────┬──────────────────┐
+  │ host  │ viewers │ booting │ cpu   │ load  │ mem   │ rx/tx Mbps │ sockets │ note             │
+  ├───────┼─────────┼─────────┼───────┼───────┼───────┼────────────┼─────────┼──────────────────┤
+  │ box-a │ 20/20   │ 0       │ 18.4% │ 2.1/8 │ 9.2%  │ 16.8/0.6   │ 4021    │                  │
+  │ box-b │ 20/20   │ 0       │ 19.1% │ 2.3/8 │ 9.4%  │ 17.2/0.6   │ 4018    │                  │
+  │ box-c │ 18/20   │ 2       │ 24.8% │ 3.9/8 │ 9.1%  │ 14.9/0.5   │ 3702    │ cpu budget spent │
+  └───────┴─────────┴─────────┴───────┴───────┴───────┴────────────┴─────────┴──────────────────┘
 ```
+
+`viewers` is running against target and `booting` is the subset of those that have not
+reported a join yet — the number admission control is spending its CPU budget on. It is
+a subset, not an addition: `20/20` with `booting 20` is a machine whose viewers are all
+up and none of which has joined.
 
 A fleet run fails at the machine level, and none of that is visible in a fleet-wide
 average. The per-machine numbers are the ones the guards judge, so a run about to be
-marked invalid looks wrong on screen first — the offending line says
+marked invalid looks wrong on screen first — the offending row says
 `BREACHED cpu_headroom` where its admission note would be. A dash means "not measured",
-never zero. `--quiet` turns the block off; without a TTY it degrades to one line every
-10 s.
+never zero.
+
+The block is sized to the terminal and never wraps: on a narrow one it gives up the
+columns that explain a problem before the ones that show it, `sockets` first and
+`degraded`, `realtime p95` and the guard verdict last. `--quiet` turns the block off;
+without a TTY it degrades to one line every 10 s.
 
 `rx/tx` is the machine's own interface counters, loopback excluded. It is the only
 measurement of what the fleet actually costs the wire: `Mbps media` above it is built

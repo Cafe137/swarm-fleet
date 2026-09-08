@@ -3,8 +3,9 @@
  *
  * `deploy` ships `dist/`, `node_modules/zod` and nothing else — half a megabyte
  * instead of the 11 MB the Swarm SDK adds — so `cli.js` must be able to reach
- * `agent --stdio` without statically importing the publisher. The publisher is
- * loaded with `await import()` for exactly that reason.
+ * `agent --stdio` without statically importing anything else. The publisher
+ * (bee-js) and the live view (cli-table3) are both loaded with `await import()`
+ * for exactly that reason: neither runs on an agent.
  *
  * Get this wrong and the failure appears only on remote machines, as
  * `ERR_MODULE_NOT_FOUND` inside an ssh pipe, several seconds into a fleet
