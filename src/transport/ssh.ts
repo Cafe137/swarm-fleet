@@ -23,6 +23,21 @@ export interface SshTarget {
   identity?: string | undefined;
   /** Command that starts the agent on the remote machine. */
   command?: string | undefined;
+  /**
+   * A box this rig created minutes ago and will destroy after the run.
+   *
+   * Skips the known_hosts dance, which on a provisioned fleet is not security
+   * but an outage: `BatchMode=yes` turns the first-contact prompt into a hard
+   * failure, so every freshly created instance would refuse to connect. And
+   * cloud providers recycle addresses, so the second fleet to land on an IP
+   * inherits the first one's key and fails the *other* way.
+   *
+   * Trust-on-first-use buys nothing here in any case: we learned this address
+   * from an authenticated API call to the provider that created the host
+   * seconds earlier. Off by default — a machine someone else administers gets
+   * the normal checks.
+   */
+  ephemeralHost?: boolean | undefined;
 }
 
 export const DEFAULT_REMOTE_COMMAND = 'swarm-fleet agent --stdio';
@@ -52,6 +67,12 @@ export function sshArgs(target: SshTarget): string[] {
     '-o',
     'ExitOnForwardFailure=yes',
   ];
+  if (target.ephemeralHost === true) {
+    args.push('-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null');
+    // Otherwise every connection prints a warning banner onto the agent's
+    // stderr, which the controller logs as though the agent had said it.
+    args.push('-o', 'LogLevel=ERROR');
+  }
   if (target.port !== undefined) {
     args.push('-p', String(target.port));
   }

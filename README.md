@@ -228,6 +228,67 @@ The controller should not host viewers in a real run — its own Node process la
 same CPU and memory budget as the viewers — so name every machine explicitly rather than
 leaving the default `local` agent in place.
 
+## Renting the machines
+
+`provision` rents boxes from Vultr, installs what an agent needs, and hands back the
+`--agent` flags to run against them. `destroy` gives them back. Both need
+`VULTR_API_KEY` in the environment; sizing does not, so `--plans` and `--dry-run` work
+before an account exists.
+
+```sh
+# what would this cost, and on what?
+npx tsx src/cli.ts provision --count 5 --viewers-per-box 50 --bitrate 2 --dry-run
+
+# rent them
+export VULTR_API_KEY=...
+npx tsx src/cli.ts provision --count 5 --viewers-per-box 50 --bitrate 2
+
+# ... run against the --agent flags it printed ...
+
+npx tsx src/cli.ts destroy --fleet 20260909-193045
+```
+
+**The plan is chosen from the measured cost of a viewer, not from a table.** A viewer
+costs `0.0085 + media_MB_per_s x 0.098` vCPU — the peering baseline and the marginal
+retrieval cost fitted to `runs/2026-09-09_17-21-15_cohort-200` — so `--viewers-per-box`
+and `--bitrate` together pick the cheapest plan with 30% headroom, and `--plans` shows
+the alternatives with the constraint that binds each one. That run is the reason this
+exists: it asked 8.7 vCPU of a six-core box, pinned the CPU and lost 95% of its viewers,
+and nothing in the rig had said no beforehand.
+
+**Dedicated vCPU is the default.** Only Vultr's `voc` family has it, and the API will not
+tell you — every plan reports `vcpu_type: "thread"`, so the family prefix is the only
+signal. On a shared vCPU there is no way to separate the viewer's work from a neighbour's
+contention, which makes core-seconds per MB unquotable. `--shared` allows the cheaper
+families and the command says plainly what it costs you.
+
+**Instances carry a tag, and teardown reads it from the provider.** `destroy --fleet <id>`
+asks Vultr which instances carry that fleet's tag rather than trusting the record under
+`provisioned/`, so a fleet survives a lost state file or a different laptop.
+`destroy --list` shows everything this rig has ever created and `destroy --all` removes it.
+A provisioning run that fails part-way destroys what it already created before reporting
+the failure — eight boxes billing by the hour because the ninth was refused is the
+expensive version of that mistake.
+
+**Boxes get five minutes of setup they would not otherwise have.** cloud-init pins Node
+(installed from nodejs.org and checksummed, so every agent in every run is one runtime),
+widens the ephemeral port range from Debian's 28,232 to 55,296 — `CLAUDE.md` calls that
+the first ceiling a machine hits — raises the descriptor limit, and **disables unattended
+upgrades**, which is the one that matters for the measurement rather than for capacity:
+apt firing mid-run spends CPU on the machine whose whole job is reporting how much CPU
+viewers cost. Readiness means that script finished, not that sshd answered, because a
+deploy racing cloud-init lands on a box with no Node.
+
+**Transfer allowance is prorated hourly and never reconciled.** A plan's 6 TB/month is
+6144/672 = 9.1 GB per hour an instance exists, and egress past that is $0.01/GB
+immediately — so the headline allowance is close to irrelevant to a rig that rents by the
+hour, and the cost estimate says what you will actually pay. Ingress is free, which is
+lucky: the fleet's traffic runs about 4:1 inbound.
+
+Regions round-robin across five locations by default. `--region <id>` (repeatable)
+overrides that. A fleet in one datacentre shares an upstream and correlates its Kademlia
+neighbourhoods, which measures something narrower than an audience.
+
 ## While it runs
 
 The live view redraws one block a second, in place: the fleet's KPIs, and then one

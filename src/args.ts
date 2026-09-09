@@ -73,4 +73,9 @@ export const BOOLEAN_FLAGS = new Set([
   '--json',
   '--stdio',
   '--quiet',
+  '--shared',
+  '--plans',
+  '--dry-run',
+  '--all',
+  '--list',
 ]);

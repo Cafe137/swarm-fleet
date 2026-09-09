@@ -20,6 +20,8 @@ export const AgentTarget = z.object({
   port: z.number().int().positive().optional(),
   identity: z.string().optional(),
   command: z.string().optional(),
+  /** Set by `provision`: skip known_hosts on a box we created and will destroy. */
+  ephemeralHost: z.boolean().optional(),
   /** Relative share of the fleet. Default 1, so machines split evenly. */
   weight: z.number().positive().default(1),
   maxViewers: z.number().int().positive().optional(),

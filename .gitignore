@@ -1,4 +1,8 @@
 node_modules/
 dist/
 runs/
+provisioned/
+.env
+.env.*
+!.env.example
 .DS_Store

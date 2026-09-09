@@ -11,6 +11,7 @@
 
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Args, defined } from './args.js';
 import { Controller, type RunResult } from './controller.js';
 import { machineInfo, preflight } from './agent/preflight.js';
@@ -33,6 +34,17 @@ import type { PublisherHandle, PublisherStats } from './publisher/control.js';
 import { ndjsonChannel } from './transport/ndjson.js';
 import { ToAgent, type FromAgent } from './transport/protocol.js';
 import { runMockViewer } from './mock/viewer.js';
+import { VultrClient } from './provision/vultr.js';
+import { capacityOf, choosePlan, demandFor, estimateCost, isDedicated, spreadRegions } from './provision/sizing.js';
+import { ensureSshKey } from './provision/ssh-key.js';
+import {
+  DEFAULT_SSH_USER,
+  DEFAULT_STATE_DIR,
+  FLEET_TAG,
+  destroyFleet,
+  listFleetStates,
+  provisionFleet,
+} from './provision/provision.js';
 
 const USAGE = `usage: swarm-fleet <command> [options]
 
@@ -44,6 +56,8 @@ commands:
   doctor    preflight this machine without running anything
   deploy    push the viewer and the agent to the machines, without running
   publish   put a live HLS stream on Swarm, for viewers to watch
+  provision rent machines to run viewers on
+  destroy   give them back
 
 run options:
   --scenario <file>      JSON scenario; flags below override it
@@ -106,6 +120,30 @@ publish options:
   --registry               also write a catalog entry
   --dump <dir>             save every published manifest here
 
+provision options:
+  --count <n>            machines to rent                      (default 1)
+  --viewers-per-box <n>  what each must hold; sizes the plan   (default 50)
+  --peers <n>            peers per viewer, for the port budget (default 128)
+  --bitrate <Mbps>       stream bitrate per viewer, for the CPU budget (default 2)
+  --plan <id>            skip sizing and use this plan exactly
+  --shared               allow shared-vCPU plans; the default is dedicated only
+  --region <id>          repeatable; round-robined  (default a spread of five)
+  --os <id>              Vultr os_id                (default 2136, Debian 12)
+  --ssh-key <path>       public key to install      (default ~/.ssh/id_*.pub)
+  --ssh-user <name>      user to connect as         (default root)
+  --state-dir <dir>      where fleet records go     (default provisioned)
+  --ready-timeout <s>    give up waiting for cloud-init        (default 600)
+  --plans                list plans that fit and exit, renting nothing
+  --dry-run              print what would be rented, and what it would cost
+  --json                 machine-readable output
+
+destroy options:
+  --fleet <id>           the fleet to destroy
+  --all                  every instance this rig ever created
+  --list                 show what exists and exit
+  --state-dir <dir>      where fleet records live   (default provisioned)
+  --json                 machine-readable output
+
 deploy options:
   --agent <host>         repeatable; the machines to deploy to
   --binary <path>        the viewer to ship
@@ -115,7 +153,38 @@ deploy options:
   --json                 print the deployment report as JSON
 `;
 
+/**
+ * Load `.env` from the fleet root, if there is one.
+ *
+ * `provision` needs `VULTR_API_KEY`, and a provider key does not belong in
+ * shell history or in a scenario file that gets written into a run directory.
+ * `.env` is gitignored and `.env.example` names the variable without the
+ * secret.
+ *
+ * Everything is tolerated: no file, an unreadable one, or a Node without
+ * `loadEnvFile` (added in 20.12). A real environment variable already set wins,
+ * because that is how CI will pass one. This must never be the reason a run
+ * fails to start — the commands that need a key say so themselves.
+ */
+function loadDotEnv(): void {
+  const load = (process as { loadEnvFile?: (path: string) => void }).loadEnvFile;
+  if (typeof load !== 'function') {
+    return;
+  }
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  // Resolves to the package root from both `src/cli.ts` and `dist/cli.js`.
+  for (const candidate of [path.join(here, '..', '.env'), path.resolve('.env')]) {
+    try {
+      load.call(process, candidate);
+      return;
+    } catch {
+      // Next candidate.
+    }
+  }
+}
+
 async function main(): Promise<number> {
+  loadDotEnv();
   const argv = process.argv.slice(2);
   const command = argv[0];
   const args = new Args(argv.slice(1));
@@ -135,6 +204,10 @@ async function main(): Promise<number> {
       return deployCommand(args);
     case 'publish':
       return publishCommand(args);
+    case 'provision':
+      return provisionCommand(args);
+    case 'destroy':
+      return destroyCommand(args);
     default:
       process.stderr.write(USAGE);
       return 2;
@@ -720,6 +793,269 @@ async function deployCommand(args: Args): Promise<number> {
     `\nrun against these with: --agent <host> --binary ${report.binary.remotePath}\n` +
       '(or just pass --deploy to `run`, which does all of this and wires it up)\n',
   );
+  return 0;
+}
+
+// ------------------------------------------------------------- provision
+
+/**
+ * Five regions on three continents, so the default fleet is not one
+ * datacentre's view of Swarm.
+ *
+ * A fleet in one location shares an upstream and correlates its Kademlia
+ * neighbourhoods, which measures something narrower than an audience. Spreading
+ * costs nothing — the plans are priced per hour, not per region.
+ */
+const DEFAULT_REGIONS = ['fra', 'ams', 'lhr', 'ewr', 'sjc'];
+
+function vultrClient(): VultrClient {
+  return new VultrClient({ apiKey: process.env['VULTR_API_KEY'] });
+}
+
+function requireApiKey(): number | undefined {
+  if ((process.env['VULTR_API_KEY'] ?? '') !== '') {
+    return undefined;
+  }
+  process.stderr.write(
+    'VULTR_API_KEY is not set.\n' +
+      '  Create a key at https://my.vultr.com/settings/#settingsapi, then:\n' +
+      '    export VULTR_API_KEY=...\n' +
+      '  The key is also IP-restricted by default; allow this machine there too.\n',
+  );
+  return 2;
+}
+
+async function provisionCommand(args: Args): Promise<number> {
+  const count = args.number('count') ?? 1;
+  const viewersPerBox = args.number('viewers-per-box') ?? 50;
+  const peers = args.number('peers') ?? 128;
+  const bitrate = args.number('bitrate') ?? 2;
+  const regions = args.values('region').length > 0 ? args.values('region') : DEFAULT_REGIONS;
+  const stateDir = args.value('state-dir') ?? DEFAULT_STATE_DIR;
+  const dedicatedOnly = !args.has('shared');
+  const spread = spreadRegions(count, regions);
+  const used = [...new Set(spread)];
+
+  // Sizing runs against the public catalogue, so `--plans` and `--dry-run`
+  // work before an account exists.
+  const catalogue = new VultrClient();
+  const plans = await catalogue.listPlans();
+  const filter = { viewersPerBox, peers, mediaMbps: bitrate, dedicatedOnly, regions: used };
+
+  if (args.has('plans')) {
+    const fits = plans
+      .filter((plan) => !dedicatedOnly || isDedicated(plan))
+      .filter((plan) => used.every((region) => plan.locations.includes(region)))
+      .map((plan) => ({ plan, capacity: capacityOf(plan, peers, bitrate) }))
+      .filter((entry) => entry.capacity.viewers >= viewersPerBox)
+      .sort((a, b) => a.plan.hourly_cost - b.plan.hourly_cost);
+    if (args.has('json')) {
+      process.stdout.write(`${JSON.stringify(fits, null, 2)}\n`);
+      return 0;
+    }
+    process.stdout.write(
+      `plans holding ${viewersPerBox} viewers at ${peers} peers, ${bitrate} Mbps, ` +
+        `in ${used.join('/')}\n\n` +
+        `${'plan'.padEnd(26)}${'vCPU'.padStart(5)}${'RAM'.padStart(7)}${'holds'.padStart(7)}` +
+        `${'bound'.padStart(8)}${'$/hr'.padStart(9)}\n`,
+    );
+    for (const { plan, capacity } of fits.slice(0, 15)) {
+      process.stdout.write(
+        `${plan.id.padEnd(26)}${String(plan.vcpu_count).padStart(5)}` +
+          `${`${(plan.ram / 1024).toFixed(0)}G`.padStart(7)}${String(capacity.viewers).padStart(7)}` +
+          `${capacity.binding.padStart(8)}${plan.hourly_cost.toFixed(4).padStart(9)}\n`,
+      );
+    }
+    return 0;
+  }
+
+  const explicit = args.value('plan');
+  const chosen =
+    explicit === undefined
+      ? choosePlan(plans, filter)
+      : plans
+          .filter((plan) => plan.id === explicit)
+          .map((plan) => ({ plan, capacity: capacityOf(plan, peers, bitrate), instances: 1 }))[0];
+
+  if (chosen === undefined) {
+    process.stderr.write(
+      explicit === undefined
+        ? `no ${dedicatedOnly ? 'dedicated-vCPU ' : ''}plan in ${used.join('/')} holds ` +
+          `${viewersPerBox} viewers at ${bitrate} Mbps. Try --shared, fewer ` +
+          `--viewers-per-box, or --plans to see what is offered.\n`
+        : `unknown plan ${explicit}; --plans lists what fits\n`,
+    );
+    return 2;
+  }
+
+  const demand = demandFor({ viewers: viewersPerBox, peers, mediaMbps: bitrate });
+  const hours = 1;
+  const cost = estimateCost(chosen.plan, count, hours, demand.egressGbPerHour);
+
+  process.stdout.write(
+    `plan     ${chosen.plan.id}  ${chosen.plan.vcpu_count} vCPU, ` +
+      `${(chosen.plan.ram / 1024).toFixed(0)} GB, ${chosen.plan.cpu_vendor ?? '?'}` +
+      `${isDedicated(chosen.plan) ? ', dedicated' : ', SHARED vCPU'}\n` +
+      `fleet    ${count} x ${viewersPerBox} viewers = ${count * viewersPerBox}, ` +
+      `${peers} peers each, ${bitrate} Mbps\n` +
+      `regions  ${spread.join(', ')}\n` +
+      `per box  ${demand.vcpu.toFixed(2)} vCPU of ${chosen.plan.vcpu_count} ` +
+      `(${((100 * demand.vcpu) / chosen.plan.vcpu_count).toFixed(0)}%), ` +
+      `${(demand.memBytes / 1024 ** 3).toFixed(1)} GB, ${demand.sockets} sockets, ` +
+      `${demand.rxMbps.toFixed(0)}/${demand.txMbps.toFixed(0)} Mbps rx/tx\n` +
+      `headroom ${chosen.capacity.viewers} viewers before ${chosen.capacity.binding} binds\n` +
+      `cost/hr  $${cost.instanceUsd.toFixed(2)} instances + $${cost.egressUsd.toFixed(2)} egress ` +
+      `= $${cost.totalUsd.toFixed(2)}` +
+      ` (${cost.egressGb.toFixed(0)} GB out, ${cost.includedGb.toFixed(0)} GB accrued)\n`,
+  );
+
+  if (!isDedicated(chosen.plan)) {
+    process.stdout.write(
+      '\nwarn: shared vCPU. Steal time is invisible to the agent, so core-seconds\n' +
+        '      per MB from this fleet cannot be quoted as the viewer\'s cost.\n',
+    );
+  }
+
+  if (args.has('dry-run')) {
+    process.stdout.write('\n--dry-run: nothing rented\n');
+    return 0;
+  }
+
+  const missing = requireApiKey();
+  if (missing !== undefined) {
+    return missing;
+  }
+
+  const client = vultrClient();
+  const key = await ensureSshKey(client, defined({ path: args.value('ssh-key') }));
+  process.stdout.write(
+    `\nssh key  ${key.name} (${key.localPath})${key.created ? ' — uploaded' : ''}\n\n`,
+  );
+
+  const readyTimeoutS = args.number('ready-timeout');
+  const abort = new AbortController();
+  const onSignal = (): void => {
+    process.stderr.write('\ninterrupted: rolling back\n');
+    abort.abort();
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
+
+  const log = (level: 'info' | 'warn', message: string): void => {
+    process.stderr.write(`provision: ${level === 'warn' ? 'warn: ' : ''}${message}\n`);
+  };
+
+  let fleet;
+  try {
+    fleet = await provisionFleet({
+      client,
+      count,
+      plan: chosen.plan.id,
+      regions: spread,
+      sshKeyIds: [key.id],
+      stateDir,
+      sshUser: args.value('ssh-user') ?? DEFAULT_SSH_USER,
+      signal: abort.signal,
+      log,
+      ...defined({ osId: args.number('os'), readyTimeoutMs: readyTimeoutS && readyTimeoutS * 1000 }),
+    });
+  } finally {
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+  }
+
+  if (args.has('json')) {
+    process.stdout.write(`${JSON.stringify(fleet, null, 2)}\n`);
+    return 0;
+  }
+
+  const agentFlags = fleet.instances
+    .map((instance) => `--agent ${fleet.sshUser}@${instance.ip}`)
+    .join(' ');
+  process.stdout.write(
+    `\nfleet ${fleet.fleetId}: ${fleet.instances.length} machine(s) ready\n` +
+      `${fleet.instances
+        .map((instance) => `  ${instance.label.padEnd(30)} ${instance.ip.padEnd(16)} ${instance.region}`)
+        .join('\n')}\n\n` +
+      `run against them:\n` +
+      `  npx tsx src/cli.ts run ${agentFlags} \\\n` +
+      `    --deploy --from-github --publish --settle \\\n` +
+      `    --viewers ${count * viewersPerBox} --peers ${peers} --duration 180\n\n` +
+      `give them back (do not forget — they bill by the hour):\n` +
+      `  npx tsx src/cli.ts destroy --fleet ${fleet.fleetId}\n`,
+  );
+  return 0;
+}
+
+async function destroyCommand(args: Args): Promise<number> {
+  const stateDir = args.value('state-dir') ?? DEFAULT_STATE_DIR;
+  const fleetId = args.value('fleet');
+
+  const missing = requireApiKey();
+  if (missing !== undefined) {
+    return missing;
+  }
+  const client = vultrClient();
+
+  if (args.has('list')) {
+    // From the provider, not the state directory: an instance nobody has a
+    // record of is exactly the one worth showing.
+    const live = await client.listInstances(FLEET_TAG);
+    if (args.has('json')) {
+      process.stdout.write(`${JSON.stringify(live, null, 2)}\n`);
+      return 0;
+    }
+    if (live.length === 0) {
+      process.stdout.write('no instances carrying the swarm-fleet tag\n');
+      return 0;
+    }
+    process.stdout.write(`${live.length} instance(s):\n`);
+    for (const instance of live) {
+      process.stdout.write(
+        `  ${instance.label.padEnd(30)} ${instance.main_ip.padEnd(16)} ` +
+          `${instance.region.padEnd(5)} ${instance.plan.padEnd(24)} ${instance.date_created}\n`,
+      );
+    }
+    const known = await listFleetStates(stateDir);
+    if (known.length > 0) {
+      process.stdout.write(
+        `\nrecorded fleets: ${known.map((fleet) => fleet.fleetId).join(', ')}\n`,
+      );
+    }
+    return 0;
+  }
+
+  if (fleetId === undefined && !args.has('all')) {
+    process.stderr.write(
+      'usage: swarm-fleet destroy --fleet <id> | --all | --list\n' +
+        '  --all destroys every instance carrying the swarm-fleet tag.\n',
+    );
+    return 2;
+  }
+
+  const result = await destroyFleet({
+    client,
+    stateDir,
+    ...defined({ fleetId }),
+    log: (level, message) =>
+      process.stderr.write(`destroy: ${level === 'warn' ? 'warn: ' : ''}${message}\n`),
+  });
+
+  if (args.has('json')) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return result.failed.length === 0 ? 0 : 1;
+  }
+  process.stdout.write(
+    `destroyed ${result.destroyed.length} instance(s)` +
+      `${result.failed.length === 0 ? '' : `, ${result.failed.length} FAILED`}\n`,
+  );
+  for (const failure of result.failed) {
+    process.stdout.write(`  ${failure.instance.label}: ${failure.error}\n`);
+  }
+  if (result.failed.length > 0) {
+    process.stdout.write('\nthese are still billing. Retry, or delete them in the console.\n');
+    return 1;
+  }
   return 0;
 }
 

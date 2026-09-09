@@ -27,7 +27,18 @@ export const PublisherConfig = z.object({
   /** Segments kept in the live manifest. */
   windowSize: z.number().int().positive().default(10),
   size: z.string().default('1120x700'),
-  bitrate: z.string().default('2600k'),
+  /**
+   * Video bitrate, which is not the bitrate a viewer pays for.
+   *
+   * ffmpeg is handed this for `-b:v`; the AAC track adds a further 128k and
+   * the MPEG-TS mux adds 3.8% on top of both — measured over the 2026-09-09
+   * cohort-200 run, where `2600k` published 286,973,916 bytes of segments for
+   * 810.5 s of media, a delivered 2832 kbps against 2728 kbps of elementary
+   * streams. So the default is set from the delivered rate backwards:
+   * (1800 + 128) x 1.038 = 2002 kbps, i.e. 2.0 Mbps on the wire and in the
+   * viewer's CPU budget, which is the number density is sized against.
+   */
+  bitrate: z.string().default('1800k'),
   gateway: z.string().default(DEFAULT_GATEWAY),
   /** Stream topic; a fresh UUID when absent, as the deployed publishers use. */
   topic: z.string().optional(),
