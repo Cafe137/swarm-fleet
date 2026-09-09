@@ -315,6 +315,16 @@ written out, flagged, and exit code 4 — rather than being quietly averaged in.
 Crashed viewers invalidate a run too, above 5% of those started: a fleet that lost
 viewers was measuring a smaller fleet than it reports.
 
+`clock_skew` is the one deliberately loose guard: it tolerates **a full second**. The
+controller applies each agent's measured offset to two fields per viewer — its start and its
+exit — and every judged number is either viewer-local (`degradedFraction`, `fetch_ms`,
+`stall_s`, all measured inside one process against its own monotonic clock) or
+controller-local (`aggregateMbps`). Sub-second drift cannot move a published figure, and a
+tighter threshold twice failed runs for a controller laptop that had not synced NTP. Past a
+second the clock is genuinely wrong and a multi-machine timeline really is smeared, so it
+fires. The offset is still reported at any size — it is worth seeing even when it is nobody's
+problem.
+
 ## Things worth knowing
 
 -   **One process per viewer, always.** The decoded-chunk cache is a `thread_local!` and

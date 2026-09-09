@@ -153,9 +153,19 @@ test('a sampler that cannot keep time invalidates the run', () => {
   assert.equal(verdict('sampler_jitter', { samples: late }).status, 'breached');
 });
 
-test('clock skew across machines breaches at 50 ms', () => {
+test('clock skew is reported only past a full second', () => {
+  // Sub-second drift cannot move a published figure: the offset is applied to
+  // two fields per viewer, and every judged number is viewer- or
+  // controller-local. A laptop 111 ms off NTP used to fail the run for it.
   assert.equal(verdict('clock_skew', { clockOffsetMs: 20 }).status, 'ok');
-  assert.equal(verdict('clock_skew', { clockOffsetMs: -400 }).status, 'breached');
+  assert.equal(verdict('clock_skew', { clockOffsetMs: -400 }).status, 'ok');
+  assert.equal(verdict('clock_skew', { clockOffsetMs: 111 }).status, 'ok');
+  // A second or more is a clock that is actually wrong.
+  assert.equal(verdict('clock_skew', { clockOffsetMs: 1_500 }).status, 'breached');
+  assert.equal(verdict('clock_skew', { clockOffsetMs: -4_000 }).status, 'breached');
+  // The offset is still reported when it is not a breach: the measurement is
+  // worth having even when it is nobody's problem.
+  assert.match(verdict('clock_skew', { clockOffsetMs: 111 }).detail, /111\.0 ms/);
 });
 
 test('agent overhead is recorded but never a reason to fail', () => {
@@ -201,12 +211,12 @@ test('dial failures rising while viewers are still joining prove nothing', () =>
 });
 
 test('a remote clock is not judged more precisely than the link allows', () => {
-  // Half the round trip is the best a request and a reply can pin a clock to.
-  // Against a real box this guard failed a machine 1.9 us off NTP.
-  assert.equal(verdict('clock_skew', { clockOffsetMs: 73, clockRttMs: 300 }).status, 'ok');
-  assert.equal(verdict('clock_skew', { clockOffsetMs: 73, clockRttMs: 20 }).status, 'breached');
-  // With a fast link the original threshold still governs.
-  assert.equal(verdict('clock_skew', { clockOffsetMs: 20, clockRttMs: 2 }).status, 'ok');
+  // Half the round trip is the best a request and a reply can pin a clock to,
+  // so a slow link raises the bar above the threshold rather than below it.
+  assert.equal(verdict('clock_skew', { clockOffsetMs: 1_500, clockRttMs: 4_000 }).status, 'ok');
+  assert.equal(verdict('clock_skew', { clockOffsetMs: 1_500, clockRttMs: 20 }).status, 'breached');
+  // On any ordinary link the threshold governs, not the round trip.
+  assert.equal(verdict('clock_skew', { clockOffsetMs: 900, clockRttMs: 2 }).status, 'ok');
   assert.match(
     verdict('clock_skew', { clockOffsetMs: 10, clockRttMs: 80 }).detail,
     /no better than 40 ms/,
@@ -214,15 +224,20 @@ test('a remote clock is not judged more precisely than the link allows', () => {
 });
 
 test('agents that agree on the offset are not the ones with the wrong clock', () => {
-  // The first real remote run: the agent was 1.9 us off NTP by its own chrony,
-  // and the whole 73 ms belonged to the controller's laptop.
-  assert.equal(controllerClockSuspect([73, 71, 76]), true);
-  assert.equal(controllerClockSuspect([-73, -71]), true);
+  // The shape of the first real remote run — the agent 1.9 us off NTP by its
+  // own chrony, the whole offset belonging to the controller's laptop — but at
+  // a magnitude that is now worth reporting.
+  assert.equal(controllerClockSuspect([1_730, 1_710, 1_760]), true);
+  assert.equal(controllerClockSuspect([-1_730, -1_710]), true);
   // One agent proves nothing: a difference cannot say which side drifted.
-  assert.equal(controllerClockSuspect([73]), false);
+  assert.equal(controllerClockSuspect([1_730]), false);
   // Disagreement means the agents are the problem, individually.
-  assert.equal(controllerClockSuspect([73, -71]), false);
-  assert.equal(controllerClockSuspect([73, 300]), false);
-  // Small offsets are nobody's problem.
+  assert.equal(controllerClockSuspect([1_730, -1_710]), false);
+  assert.equal(controllerClockSuspect([1_730, 6_000]), false);
+  // Agreement is judged on the link's own error, not on the drift threshold:
+  // two agents a second apart are not agreeing, however large both offsets are.
+  assert.equal(controllerClockSuspect([1_100, 2_000]), false);
+  // Below the reporting threshold there is no problem to attribute at all.
+  assert.equal(controllerClockSuspect([73, 71, 76]), false);
   assert.equal(controllerClockSuspect([2, 3]), false);
 });

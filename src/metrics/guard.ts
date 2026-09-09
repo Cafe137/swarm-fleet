@@ -15,7 +15,42 @@ import { quantile } from './percentile.js';
 export const GUARD_CPU_LOAD_FRACTION = 0.8;
 export const GUARD_MEMORY_FRACTION = 0.8;
 export const GUARD_SAMPLER_LAG_MS = 250;
-export const GUARD_CLOCK_SKEW_MS = 50;
+/**
+ * Drift worth reporting, between an agent's clock and the controller's.
+ *
+ * A full second, not the 50 ms this started at, because 50 ms was calibrated
+ * against a fear rather than against what the offset actually feeds. The
+ * controller applies it to exactly two fields per viewer — when it started and
+ * when it exited — and nothing else. Every number a run is judged on is either
+ * viewer-local or controller-local:
+ *
+ *   - `degradedFraction`, `realtimeFactor`, `fetch_ms`, `stall_s` are durations
+ *     each viewer measures against its own monotonic clock, inside one process.
+ *   - `aggregateMbps` divides controller-side bytes by a controller-side window.
+ *   - `stagger_adherence` diffs consecutive starts on the *same* agent, so the
+ *     offset cancels out of it entirely.
+ *
+ * So a hundred milliseconds cannot move a single published figure, and failing
+ * a run for it told the reader the capacity number was untrustworthy when the
+ * defect was a laptop that had not synced NTP recently.
+ *
+ * A second or more is different in kind: that is a machine whose clock is
+ * actually wrong — a suspended laptop, a VM with a bad TSC, NTP not running —
+ * and then the cross-machine timeline a multi-agent run stitches together is
+ * genuinely smeared, and you want to know before reading the report.
+ */
+export const GUARD_CLOCK_SKEW_MS = 1_000;
+/**
+ * How close two agents' offsets must be to count as *agreeing*.
+ *
+ * Deliberately not `GUARD_CLOCK_SKEW_MS`, though it once was. This is the error
+ * on each link's own measurement, not a tolerance for drift, and raising it with
+ * the threshold above would have quietly broken the thing it protects: two
+ * agents reporting +1.1 s and +2.0 s would have counted as agreement and blamed
+ * the controller, when in truth they are 900 ms apart and at least one of them
+ * is the problem.
+ */
+export const GUARD_CLOCK_AGREEMENT_MS = 50;
 export const GUARD_STAGGER_VIOLATION_FRACTION = 0.05;
 /** Consecutive breaching samples before a guard is considered breached. */
 export const GUARD_SUSTAIN_SAMPLES = 3;
@@ -327,6 +362,8 @@ export function controllerClockSuspect(offsetsMs: readonly number[]): boolean {
   if (offsetsMs.length < 2) {
     return false;
   }
+  // Only worth attributing a drift that is worth reporting in the first place:
+  // below `GUARD_CLOCK_SKEW_MS` nothing is wrong, so there is nobody to blame.
   const sameSide = offsetsMs.every((offset) => Math.abs(offset) > GUARD_CLOCK_SKEW_MS) &&
     (offsetsMs.every((offset) => offset > 0) || offsetsMs.every((offset) => offset < 0));
   if (!sameSide) {
@@ -334,5 +371,5 @@ export function controllerClockSuspect(offsetsMs: readonly number[]): boolean {
   }
   const spread = Math.max(...offsetsMs) - Math.min(...offsetsMs);
   // Agreement, not identity: each measurement carries its own link's error.
-  return spread <= GUARD_CLOCK_SKEW_MS;
+  return spread <= GUARD_CLOCK_AGREEMENT_MS;
 }
