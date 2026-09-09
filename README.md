@@ -59,6 +59,7 @@ npx tsx src/cli.ts run --mode cohort --viewers 6 --binary mock --segments 20 \
 | `MOCK_CRASH_AFTER_MS` | 0 | injected crash |
 | `MOCK_IGNORE_SIGTERM` | — | set to `1` to test the SIGKILL backstop |
 | `MOCK_FETCH_MS`, `MOCK_FETCH_JITTER`, `MOCK_SEGMENT_BYTES`, `MOCK_PEERS`, `MOCK_RUNWAY_SECONDS` | | shape of the fake workload |
+| `MOCK_PEERS_EVICT_AFTER_MS`, `MOCK_PEERS_EVICT_TO` | `0` (off), `0.3` | drop to this share of the peer limit after this long, simulating a full NAT table — the only way to exercise `peer_target` end to end |
 
 ## Scenarios
 
@@ -68,7 +69,7 @@ npx tsx src/cli.ts run --mode cohort --viewers 6 --binary mock --segments 20 \
 | `ramp` | `--ramp-start`, `+--ramp-step` every `--ramp-interval`, to `--ramp-max` | **"How many viewers before Swarm breaks?"** |
 | `soak` | fixed N, long duration | drift: leaks, peer churn, buffer decay |
 | `flood` | N at once, no stagger. Needs `--acknowledge-flood` | join storms. Marked **not comparable** |
-| `port-ceiling` | one machine, ramp until dials fail | "how many viewers before a box runs out of ports?" |
+| `port-ceiling` | one machine, ramp until viewers stop getting their peers | "how many viewers before a box runs out of connections?" |
 
 ### `--verify` / `--unsafe`: what a viewer costs, versus what it costs honestly
 
@@ -124,8 +125,15 @@ is a steady-state capacity test** — see `IMPROVEMENTS.md` for what each one is
 measuring.
 
 A ramp stops when a KPI breach *holds* for `--hold` seconds — `--stop-degraded` (default
-0.10) or `--stop-join` (default 0.95). One slow segment across 200 viewers is weather, not
-a cliff.
+0.10), `--stop-join` (default 0.95) or `--stop-peers` (default 0.90). One slow segment across
+200 viewers is weather, not a cliff.
+
+`--stop-peers` is the **connection ceiling**, and it is the one that finds a NAT. A box behind
+one holds a fixed total number of connections whatever you do, so the ceiling never announces
+itself as a stall or a failed dial — it shows up as viewers quietly holding fewer peers than
+they were told to, and a ramp that climbs past it is adding processes, not load. Stopping
+there makes the last passing step the machine's real capacity, and the report's capacity curve
+carries a `Peers held` column so the plateau is visible.
 
 Anything not expressible in flags goes in a scenario file:
 
@@ -369,12 +377,33 @@ stall later, so that curve moves first.
 ## Guard KPIs, and why a run can be marked invalid
 
 A load rig's one fatal failure is reporting the generator's limits as the network's. So
-every run also judges the rig: CPU and memory headroom, dial failures, stagger adherence,
-sampler lateness, clock skew. A breach makes the run **invalid** — the numbers are still
-written out, flagged, and exit code 4 — rather than being quietly averaged in.
+every run also judges the rig: CPU and memory headroom, dial failures, **peer footprint**,
+stagger adherence, sampler lateness, clock skew. A breach makes the run **invalid** — the
+numbers are still written out, flagged, and exit code 4 — rather than being quietly averaged
+in.
 
 Crashed viewers invalidate a run too, above 5% of those started: a fleet that lost
 viewers was measuring a smaller fleet than it reports.
+
+`peer_target` asks whether the viewers actually held the peers they were told to hold, and
+it exists because nothing did. A rented box behind a NAT was measured holding **~16,000
+connections in total however many viewers wanted them**: at 64 viewers x 200 peers every
+viewer held all 200, at 80 viewers *none* of them did, and at 128 the fleet still held
+~15,800 — the last viewers to start held 200 while the first were down to 1, because a full
+NAT table evicts its oldest translation to make room for a new one. The generator produced
+roughly half the connection load the run asked for, and **every existing guard passed**:
+load was 3.27 of 122 cores, memory 196 GB free, and `dial_failures` was silent because it
+only counts growth once viewers have settled and a viewer that cannot get peers never
+settles. The stalls that followed would have been published as Swarm's.
+
+It is judged on peers *held*, not peaks — an evicting NAT lets every viewer reach its target
+before taking the connections back — and the two shapes are named apart, because they point
+at different places to look: **evicted** (reached the target, then lost it) means something
+between the fleet and the network is taking connections away; **starved** (never reached it)
+means the peer limit, the dial rate, or a table that was already full. A viewer short of its
+peers is not a degraded viewer but a *smaller* one, so this cannot be seen in
+`degradedFraction`. In `port-ceiling` and `flood` the shortfall is the measurement rather
+than a fault, so there it is recorded without voiding the run.
 
 `clock_skew` is the one deliberately loose guard: it tolerates **a full second**. The
 controller applies each agent's measured offset to two fields per viewer — its start and its

@@ -79,6 +79,9 @@ run options:
   --ramp-start / --ramp-step / --ramp-interval / --ramp-max
   --stop-degraded <f>    degraded-viewer share that ends a ramp  (default 0.10)
   --stop-join <f>        join success below which a ramp ends    (default 0.95)
+  --stop-peers <f>       share of viewers holding their full peer footprint
+                         below which a ramp ends: the connection ceiling
+                         (default 0.90)
   --hold <s>             how long a breach must hold             (default 30)
   --min-start-interval <ms>   floor between viewer starts        (default 250)
   --grace <ms>           time a viewer gets to finish after SIGTERM (default 15000)
@@ -335,6 +338,7 @@ async function scenarioFromArgs(args: Args): Promise<unknown> {
   const stop = defined({
     degradedFraction: args.number('stop-degraded'),
     joinSuccessRate: args.number('stop-join'),
+    peerAttainment: args.number('stop-peers'),
     holdS: args.number('hold'),
   });
   const admission = defined({ minStartIntervalMs: args.number('min-start-interval') });

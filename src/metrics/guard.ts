@@ -10,6 +10,11 @@
  */
 
 import type { MachineInfo, MachineSample } from '../transport/protocol.js';
+import {
+  describePeerShortfall,
+  type PeerAttainment,
+  summarisePeerAttainment,
+} from './peers.js';
 import { quantile } from './percentile.js';
 
 export const GUARD_CPU_LOAD_FRACTION = 0.8;
@@ -52,6 +57,16 @@ export const GUARD_CLOCK_SKEW_MS = 1_000;
  */
 export const GUARD_CLOCK_AGREEMENT_MS = 50;
 export const GUARD_STAGGER_VIOLATION_FRACTION = 0.05;
+/**
+ * Share of viewers allowed to miss their peer footprint before the run is void.
+ *
+ * A tenth, because a viewer short of its peers is not a degraded viewer but a
+ * *smaller* viewer: it opens fewer connections, retrieves over fewer routes and
+ * costs the network less, so the fleet is no longer the fleet the run asked for
+ * and `aggregateMbps` describes a cohort that did not exist. Healthy cohorts
+ * measure 0 here, so this is tolerance for one straggler in ten, not a budget.
+ */
+export const GUARD_PEER_SHORTFALL_FRACTION = 0.1;
 /** Consecutive breaching samples before a guard is considered breached. */
 export const GUARD_SUSTAIN_SAMPLES = 3;
 
@@ -77,6 +92,17 @@ export interface GuardInput {
   dialFailureSeries: readonly number[];
   /** Viewers bootstrapping at each sample, parallel to `dialFailureSeries`. */
   bootstrappingSeries?: readonly number[] | undefined;
+  /** Per-viewer peer footprint on this agent, for `peer_target`. */
+  peerAttainment?: readonly PeerAttainment[] | undefined;
+  /**
+   * Report a peer shortfall without invalidating the run.
+   *
+   * Set for the modes whose whole purpose is to find the point where viewers
+   * stop getting their peers — `port-ceiling` and `flood`. There the shortfall
+   * is the measurement, and failing the run for finding it would throw away the
+   * answer. Everywhere else it means the cohort was never fully built.
+   */
+  peerTargetAdvisory?: boolean | undefined;
   /**
    * When the measurement window opened, for a run with a settle phase.
    *
@@ -104,6 +130,7 @@ export function evaluateGuards(input: GuardInput): GuardVerdict[] {
     cpuHeadroom(input),
     memoryHeadroom(input),
     dialFailures(input),
+    peerTarget(input),
     staggerAdherence(input),
     samplerJitter(input),
     clockSkew(input),
@@ -224,6 +251,63 @@ function dialFailures({ dialFailureSeries, bootstrappingSeries }: GuardInput): G
         : `dial failures rose for ${GUARD_SUSTAIN_SAMPLES} consecutive ticks after the fleet settled (${total} total) — suspect ephemeral ports, not Swarm`,
     value: total,
     threshold: 0,
+  };
+}
+
+/**
+ * Did the viewers on this box hold the peer footprint the run asked for?
+ *
+ * The companion to `dial_failures`, and the one that actually fires. Dial
+ * failures are gated on the fleet having settled, and a viewer that cannot get
+ * peers never settles — so the box where 48 viewers sat at zero peers produced
+ * `no_data` there while CPU and memory sailed through on 3.27 of 122 cores and
+ * 196 GB free. This asks the question from the other end: never mind how many
+ * dials failed, how many peers are actually *held*.
+ *
+ * Judged on final counts rather than peaks on purpose. A NAT table that evicts
+ * its oldest entry lets every viewer reach its target and then takes the
+ * connections back, so a peak-only check reports a healthy fleet at the exact
+ * moment the fleet is dissolving. `summarisePeerAttainment` keeps peak and
+ * final apart so the detail line can say which of the two happened.
+ */
+function peerTarget({ peerAttainment, peerTargetAdvisory }: GuardInput): GuardVerdict {
+  if (peerAttainment === undefined || peerAttainment.length === 0) {
+    return {
+      name: 'peer_target',
+      status: 'no_data',
+      detail: 'no viewer peer counts for this agent',
+    };
+  }
+  const summary = summarisePeerAttainment(peerAttainment);
+  if (summary.judged === 0) {
+    return {
+      name: 'peer_target',
+      status: 'no_data',
+      detail:
+        `no viewer ran long enough to have joined ` +
+        `(${summary.skipped} too young or crashed)`,
+    };
+  }
+  const shortfall = summary.shortfallFraction ?? 0;
+  const breached = shortfall > GUARD_PEER_SHORTFALL_FRACTION;
+  const detail = describePeerShortfall(summary);
+  if (breached && peerTargetAdvisory === true) {
+    return {
+      name: 'peer_target',
+      status: 'not_applicable',
+      detail: `${detail} — recorded, not fatal: this mode is looking for that limit`,
+      value: shortfall,
+      threshold: GUARD_PEER_SHORTFALL_FRACTION,
+    };
+  }
+  return {
+    name: 'peer_target',
+    status: breached ? 'breached' : 'ok',
+    detail: breached
+      ? detail
+      : `${summary.holding} of ${summary.judged} viewers held their peer footprint`,
+    value: shortfall,
+    threshold: GUARD_PEER_SHORTFALL_FRACTION,
   };
 }
 

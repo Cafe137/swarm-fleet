@@ -72,11 +72,18 @@ export function renderReport(summary: RunSummary): string {
   if (summary.rampSteps.length > 0) {
     lines.push('## Capacity curve');
     lines.push('');
-    lines.push('| Target | Active | Degraded | Realtime p95 | Join success | Mbps |');
-    lines.push('| --- | --- | --- | --- | --- | --- |');
+    // `Peers held` is the column that makes a connection ceiling visible: it
+    // stops rising while `Active` keeps climbing, and no other column here can
+    // show that — a fleet whose viewers quietly hold fewer peers is generating
+    // less load, not worse load, so it need not be degraded or stalling at all.
+    lines.push(
+      '| Target | Active | Peers held | Peer attainment | Degraded | Realtime p95 | Join success | Mbps |',
+    );
+    lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
     for (const step of summary.rampSteps) {
       lines.push(
-        `| ${step.target} | ${step.active} | ${percent(step.degradedFraction)} | ` +
+        `| ${step.target} | ${step.active} | ${step.peersHeld ?? '—'} | ` +
+          `${percent(step.peerAttainedFraction)} | ${percent(step.degradedFraction)} | ` +
           `${fixed(step.realtimeFactorP95, 2)} | ${percent(step.joinSuccessRate)} | ` +
           `${fixed(step.aggregateMbps, 1)} |`,
       );

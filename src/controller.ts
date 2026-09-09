@@ -18,6 +18,11 @@ import {
   type GuardVerdict,
   guardsValid,
 } from './metrics/guard.js';
+import {
+  describePeerShortfall,
+  type PeerAttainment,
+  summarisePeerAttainment,
+} from './metrics/peers.js';
 import { partition } from './schedule.js';
 import type { ResolvedScenario } from './scenario.js';
 import { localChannelPair } from './transport/local.js';
@@ -69,6 +74,9 @@ export interface RampStep {
   realtimeFactorP95?: number | undefined;
   joinSuccessRate?: number | undefined;
   aggregateMbps?: number | undefined;
+  /** Peers held across the fleet, and the share of what was asked for. */
+  peersHeld?: number | undefined;
+  peerAttainedFraction?: number | undefined;
 }
 
 export interface LiveSnapshot {
@@ -713,9 +721,17 @@ export class Controller {
       const kpis = this.liveKpis();
       const degraded = kpis.degradedFraction;
       const joinRate = kpis.joinSuccessRate;
+      // The connection ceiling. Judged on peers *held*, so a fleet whose
+      // viewers reached their target and then had connections taken back counts
+      // as breaching — that shape is invisible to `degradedFraction`, which
+      // only sees a viewer that is also stalling, and to `joinSuccessRate`,
+      // which is about joining a stream rather than acquiring peers.
+      const peers = summarisePeerAttainment(this.peerAttainmentFor());
+      const attained = peers.judged === 0 ? undefined : peers.holding / peers.judged;
       const breaching =
         (degraded !== undefined && degraded > this.scenario.stop.degradedFraction) ||
-        (joinRate !== undefined && joinRate < this.scenario.stop.joinSuccessRate);
+        (joinRate !== undefined && joinRate < this.scenario.stop.joinSuccessRate) ||
+        (attained !== undefined && attained < this.scenario.stop.peerAttainment);
 
       if (!breaching) {
         this.breachSinceMs = undefined;
@@ -732,6 +748,9 @@ export class Controller {
         if (joinRate !== undefined && joinRate < this.scenario.stop.joinSuccessRate) {
           parts.push(`join success ${(joinRate * 100).toFixed(1)}%`);
         }
+        if (attained !== undefined && attained < this.scenario.stop.peerAttainment) {
+          parts.push(describePeerShortfall(peers));
+        }
         return `stop condition held for ${this.scenario.stop.holdS}s: ${parts.join('; ')}`;
       }
     }
@@ -740,6 +759,7 @@ export class Controller {
 
   private recordRampStep(target: number): void {
     const kpis = this.liveKpis();
+    const peers = summarisePeerAttainment(this.peerAttainmentFor());
     this.rampSteps.push({
       atMs: Date.now(),
       elapsedS: (Date.now() - this.startedAtMs) / 1000,
@@ -749,6 +769,8 @@ export class Controller {
       realtimeFactorP95: kpis.realtimeFactorP95,
       joinSuccessRate: kpis.joinSuccessRate,
       aggregateMbps: this.throughput.mbps(Date.now()),
+      peersHeld: peers.peersHeld,
+      peerAttainedFraction: peers.attainedFraction,
     });
   }
 
@@ -1024,6 +1046,27 @@ export class Controller {
     return cohortKpis(this.records(), this.requested, elapsed);
   }
 
+  /**
+   * Per-viewer peer footprints, for the `peer_target` guard and the ramp stop.
+   *
+   * `agent` undefined means the whole fleet: the guard judges one box, the
+   * connection ceiling is a property of the run. `exitedAtMs` is absent while a
+   * viewer is still running, so a lifetime is measured to now — which is what
+   * makes this usable live, during a ramp, and not only in the final report.
+   */
+  private peerAttainmentFor(agent?: string): PeerAttainment[] {
+    const now = Date.now();
+    return this.records()
+      .filter((record) => agent === undefined || record.agent === agent)
+      .map((record) => ({
+        target: record.peerLimit,
+        peak: record.peersMax ?? 0,
+        last: record.peersLast ?? 0,
+        lifetimeMs: (record.exitedAtMs ?? now) - record.startedAtMs,
+        crashed: record.outcome === 'crashed',
+      }));
+  }
+
   private dialFailuresFor(agent: string): number {
     let total = 0;
     for (const record of this.records()) {
@@ -1051,6 +1094,11 @@ export class Controller {
         clockRttMs: link.report.clockRttMs,
         dialFailureSeries: link.dialFailureSeries,
         bootstrappingSeries: link.bootstrappingSeries,
+        peerAttainment: this.peerAttainmentFor(link.report.name),
+        // `port-ceiling` and `flood` exist to find the point where viewers stop
+        // getting peers, so there the shortfall is the answer, not a fault.
+        peerTargetAdvisory:
+          this.scenario.mode === 'port-ceiling' || this.scenario.mode === 'flood',
         // Only set for a settled run: elsewhere it equals the run's start and
         // scopes nothing.
         ...(this.scenario.settle === undefined ? {} : { measuredFromMs: this.measuredFromMs }),

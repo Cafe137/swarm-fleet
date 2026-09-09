@@ -128,6 +128,35 @@ test('viewers that crash invalidate the run rather than shrinking it quietly', a
   assert.match(result.invalidBecause.join(' '), /crashed or never joined/);
 });
 
+/**
+ * The failure this rig could not previously see: viewers acquire their peers
+ * and then have them taken away, so the fleet generates a fraction of the
+ * connection load it was asked for while every other guard reads healthy. The
+ * box that motivated it had 122 cores at a load of 3.27 and 196 GB free.
+ */
+test('viewers that lose the peers they acquired invalidate the run', async () => {
+  const { result } = await runScenario({
+    viewers: 3,
+    segments: 200,
+    env: { ...FAST_ENV, MOCK_PEERS_EVICT_AFTER_MS: '2000', MOCK_PEERS_EVICT_TO: '0.3' },
+  });
+
+  assert.equal(result.valid, false);
+  assert.match(result.invalidBecause.join(' '), /peer_target/);
+  // Named as eviction, because that points somewhere different from starvation.
+  assert.match(result.invalidBecause.join(' '), /reached the target then lost it/);
+  assert.match(result.invalidBecause.join(' '), /NAT|conntrack/);
+});
+
+test('a cohort that holds its peer footprint passes the peer guard', async () => {
+  const { result } = await runScenario({ viewers: 3 });
+  const peer = result.agents
+    .flatMap((agent) => agent.guards ?? [])
+    .find((guard) => guard.name === 'peer_target');
+  assert.ok(peer !== undefined, 'no peer_target verdict');
+  assert.equal(peer.status, 'ok');
+});
+
 test('body failures are counted, at roughly the rate they are injected', async () => {
   const { result } = await runScenario({
     viewers: 4,

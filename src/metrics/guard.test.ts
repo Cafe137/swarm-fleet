@@ -7,6 +7,7 @@ import {
   GUARD_SUSTAIN_SAMPLES,
 } from './guard.js';
 import type { MachineInfo, MachineSample } from '../transport/protocol.js';
+import type { PeerAttainment } from './peers.js';
 
 const machine: MachineInfo = {
   hostname: 'box',
@@ -39,6 +40,8 @@ function guards(overrides: {
   clockRttMs?: number;
   admissionDisabled?: boolean;
   measuredFromMs?: number;
+  peerAttainment?: PeerAttainment[];
+  peerTargetAdvisory?: boolean;
 }) {
   return evaluateGuards({
     machine,
@@ -55,6 +58,12 @@ function guards(overrides: {
     ...(overrides.measuredFromMs === undefined
       ? {}
       : { measuredFromMs: overrides.measuredFromMs }),
+    ...(overrides.peerAttainment === undefined
+      ? {}
+      : { peerAttainment: overrides.peerAttainment }),
+    ...(overrides.peerTargetAdvisory === undefined
+      ? {}
+      : { peerTargetAdvisory: overrides.peerTargetAdvisory }),
   });
 }
 
@@ -240,4 +249,78 @@ test('agents that agree on the offset are not the ones with the wrong clock', ()
   // Below the reporting threshold there is no problem to attribute at all.
   assert.equal(controllerClockSuspect([73, 71, 76]), false);
   assert.equal(controllerClockSuspect([2, 3]), false);
+});
+
+// ------------------------------------------------------------- peer_target
+
+function peered(count: number, last: number, peak = 200): PeerAttainment[] {
+  return Array.from({ length: count }, () => ({
+    target: 200,
+    peak,
+    last,
+    lifetimeMs: 120_000,
+    crashed: false,
+  }));
+}
+
+function pick(name: string, all: ReturnType<typeof guards>) {
+  const found = all.find((guard) => guard.name === name);
+  assert.ok(found !== undefined, `no ${name} verdict`);
+  return found;
+}
+
+test('peer_target passes a cohort holding its footprint', () => {
+  const all = guards({ peerAttainment: peered(64, 200) });
+  assert.equal(pick('peer_target', all).status, 'ok');
+  assert.equal(guardsValid(all), true);
+});
+
+test('peer_target has no opinion without peer counts', () => {
+  assert.equal(verdict('peer_target', {}).status, 'no_data');
+});
+
+test('peer_target breaches when viewers do not hold the peers they were told to', () => {
+  const all = guards({ peerAttainment: peered(80, 102) });
+  assert.equal(pick('peer_target', all).status, 'breached');
+  assert.equal(guardsValid(all), false);
+});
+
+test('one straggler in ten is tolerated, two is not', () => {
+  assert.equal(
+    verdict('peer_target', { peerAttainment: [...peered(9, 200), ...peered(1, 0, 0)] }).status,
+    'ok',
+  );
+  assert.equal(
+    verdict('peer_target', { peerAttainment: [...peered(8, 200), ...peered(2, 0, 0)] }).status,
+    'breached',
+  );
+});
+
+test('a mode hunting for the connection ceiling records the shortfall without voiding the run', () => {
+  const all = guards({ peerAttainment: peered(80, 102), peerTargetAdvisory: true });
+  const peer = pick('peer_target', all);
+  assert.equal(peer.status, 'not_applicable');
+  assert.match(peer.detail, /looking for that limit/);
+  assert.equal(guardsValid(all), true);
+});
+
+/**
+ * The run that motivated this guard: 128 viewers on a 122-core box behind a
+ * NAT, 48 of them at zero peers. Every existing guard passed — CPU and memory
+ * had enormous headroom, and `dial_failures` could not speak because a viewer
+ * that cannot get peers never settles, so its gate never opened.
+ */
+test('the NAT-starved fleet that passed every other guard is caught by this one', () => {
+  const all = guards({
+    // 122 cores, load 3.27: nowhere near the CPU guard.
+    samples: [sample({ loadAvg1: 3.27 }), sample({ loadAvg1: 3.27 }), sample({ loadAvg1: 3.3 })],
+    // Dial failures climbed the whole run, but nothing ever settled.
+    dialFailureSeries: [0, 20_000, 60_000, 93_937],
+    bootstrappingSeries: [48, 48, 48, 48],
+    peerAttainment: [...peered(80, 200), ...peered(48, 0, 0)],
+  });
+  assert.equal(pick('dial_failures', all).status, 'no_data');
+  assert.equal(pick('cpu_headroom', all).status, 'ok');
+  assert.equal(pick('peer_target', all).status, 'breached');
+  assert.equal(guardsValid(all), false);
 });

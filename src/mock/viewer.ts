@@ -43,6 +43,8 @@ export interface MockConfig {
   joinFailRate: number;
   crashAfterMs: number;
   peersRampMs: number;
+  peersEvictAfterMs: number;
+  peersEvictTo: number;
   peerLimit: number;
   runwaySeconds: number;
   ignoreTerminate: boolean;
@@ -114,6 +116,13 @@ export function mockConfigFromEnv(env: Record<string, string | undefined>): Mock
     joinFailRate: number('MOCK_JOIN_FAIL_RATE', 0),
     crashAfterMs: number('MOCK_CRASH_AFTER_MS', 0),
     peersRampMs: number('MOCK_PEERS_RAMP_MS', 8_000),
+    // Simulated peer eviction: a full NAT table between the fleet and the
+    // network takes established connections back to make room for newer ones,
+    // which is how a real box was measured holding ~16,000 connections however
+    // many viewers asked. Off by default; without it the mock can only ever
+    // gain peers, and `peer_target` has no end-to-end test.
+    peersEvictAfterMs: number('MOCK_PEERS_EVICT_AFTER_MS', 0),
+    peersEvictTo: number('MOCK_PEERS_EVICT_TO', 0.3),
     peerLimit: number('MOCK_PEERS', 200),
     runwaySeconds: number('MOCK_RUNWAY_SECONDS', 8),
     ignoreTerminate: env['MOCK_IGNORE_SIGTERM'] === '1',
@@ -273,9 +282,25 @@ export async function runMockViewer(
     if (!config.hang && deadlineS !== undefined && elapsed() >= deadlineS) {
       break;
     }
-    if (peers < peerLimit) {
-      peers = Math.min(peerLimit, peers + Math.round(peerLimit / 20));
-      emit({ ev: 'peers', peers, dial_failures: dialFailures });
+    // Peers arrive on the clock, not once per segment. The real viewer reaches
+    // its full footprint in 5-15 s whatever it happens to be watching, so
+    // stepping this per segment left a short run parked at 60% of its peer
+    // limit — which now reads, correctly, as a fleet that never built the load
+    // it was asked for, and made `peer_target` unexercisable by the mock.
+    const evicting =
+      config.peersEvictAfterMs > 0 && simMs() >= config.peersEvictAfterMs;
+    if (evicting) {
+      const held = Math.round(peerLimit * config.peersEvictTo);
+      if (peers !== held) {
+        peers = held;
+        emit({ ev: 'peers', peers, dial_failures: dialFailures });
+      }
+    } else if (peers < peerLimit) {
+      const arrived = Math.min(peerLimit, Math.round((simMs() / config.peersRampMs) * peerLimit));
+      if (arrived > peers) {
+        peers = arrived;
+        emit({ ev: 'peers', peers, dial_failures: dialFailures });
+      }
     }
 
     if (config.skipRate > 0 && random() < config.skipRate) {

@@ -32,6 +32,20 @@ export const StopCondition = z.object({
   /** Share of viewers losing more than 1% of media time to stalling. */
   degradedFraction: z.number().min(0).max(1).default(0.1),
   joinSuccessRate: z.number().min(0).max(1).default(0.95),
+  /**
+   * Share of viewers that must still hold their full peer footprint.
+   *
+   * The connection ceiling, and the reason `port-ceiling` can now find one. A
+   * box behind a NAT holds a fixed total number of connections however many
+   * viewers ask: measured at 64 viewers x 200 peers every viewer held all 200,
+   * at 80 none of them did, and the fleet total stayed pinned either way. So
+   * the ceiling does not announce itself as a stall or a failed dial — it shows
+   * up as viewers quietly holding fewer peers than they were told to, and a
+   * ramp that keeps climbing past it is adding processes, not load.
+   *
+   * Stopping here makes the last passing step the machine's real capacity.
+   */
+  peerAttainment: z.number().min(0).max(1).default(0.9),
   /** A breach must hold this long. One slow segment is not a cliff. */
   holdS: z.number().positive().default(30),
 });
