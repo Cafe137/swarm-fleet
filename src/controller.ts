@@ -39,6 +39,7 @@ import { writeJson } from './run-dir.js';
 const HELLO_TIMEOUT_MS = 30_000;
 const READY_TIMEOUT_MS = 60_000;
 const COLLECT_TIMEOUT_MS = 120_000;
+
 const SSH_STDERR_TAIL = 6;
 const CLOCK_PINGS = 9;
 const CLOCK_PING_SPACING_MS = 40;
@@ -200,6 +201,12 @@ export class Controller {
   /** Caveats observed during the run, alongside the scenario's own. */
   private readonly observedCaveats: string[] = [];
   private aborted = false;
+  /** Controller-clock instant the most recent viewer started. */
+  private lastViewerStartMs = 0;
+  /** Controller-clock instant the most recent viewer reported joining. */
+  private lastViewerJoinMs = 0;
+  /** Live per-viewer event logs, so a run that dies still leaves its data. */
+  private readonly viewerLogs = new Map<string, WriteStream>();
   private requested = 0;
   private stoppedBecause = 'not started';
   private breachSinceMs: number | undefined;
@@ -221,6 +228,9 @@ export class Controller {
     await this.awaitReady(force);
 
     await mkdir(path.join(this.runDir, 'machines'), { recursive: true });
+    // Made up front, not at collect time: viewer events are streamed here from
+    // the first one that arrives.
+    await mkdir(path.join(this.runDir, 'viewers'), { recursive: true });
     await writeJson(path.join(this.runDir, 'run.json'), this.runManifest());
 
     this.startTicking();
@@ -496,20 +506,83 @@ export class Controller {
     this.setTotalTarget(total, 'none');
     await this.settleAndRelease(total);
 
-    const deadline = this.measuredFromMs + this.scenario.maxRunS * 1_000;
+    const ceilingMs = this.measuredFromMs + this.scenario.maxRunS * 1_000;
     // Viewers bounded by `--segments` or `--duration` end on their own; the
     // run is over when every requested viewer has started and none is left.
     const spent = (): boolean =>
       this.links.every((link) => link.startsExhausted || link.target === 0);
+    const finished = (): boolean => spent() && this.totalActive() === 0;
+
     await this.waitFor(
-      () => spent() && this.totalActive() === 0,
-      Math.max(deadline - Date.now(), 1_000),
+      () => this.aborted || finished() || this.stragglersOverdue(),
+      Math.max(ceilingMs - Date.now(), 1_000),
       undefined,
     );
-    this.stoppedBecause =
-      spent() && this.totalActive() === 0
-        ? `every one of ${this.totalStarted()} viewers finished`
-        : `hit the ${this.scenario.maxRunS}s run ceiling`;
+
+    if (this.aborted) {
+      // `abort` has already stopped everything; saying so here stops the
+      // straggler branch below from reporting a hang that did not happen.
+      return;
+    }
+    if (finished()) {
+      this.stoppedBecause = `every one of ${this.totalStarted()} viewers finished`;
+      return;
+    }
+
+    // Past this point the run is over as far as the measurement goes, and what
+    // is left is viewers that will not end themselves. Stopping them is the
+    // whole point: waiting instead is what held the first Vultr run open for
+    // fifteen minutes and cost it every viewer record it had collected.
+    const hung = this.totalActive();
+    if (this.stragglersOverdue()) {
+      this.hooks.onLog?.('warn', `${hung} viewer(s) outlived their duration; stopping them`);
+      await this.stopAll();
+      const left = this.totalActive();
+      this.stoppedBecause =
+        `every one of ${this.totalStarted()} viewers finished, ` +
+        `${hung} only after being stopped as hung` +
+        (left === 0 ? '' : ` (${left} never acknowledged)`);
+      // A hung viewer's own numbers are lost, so the run is not a clean
+      // measurement of the fleet it claims to describe.
+      this.invalid(`${hung} viewer(s) had to be killed after outliving their duration`);
+      return;
+    }
+    this.stoppedBecause = `hit the ${this.scenario.maxRunS}s run ceiling`;
+    await this.stopAll();
+  }
+
+  /**
+   * Whether viewers are still alive well past the point they should have ended.
+   *
+   * Only meaningful for a duration-bounded run — `--segments` gives no instant
+   * to measure from, so those keep the `maxRunS` ceiling as their only bound.
+   *
+   * The instant to measure from is the latest of three, because a viewer's
+   * `--duration` clock does not start when the process does:
+   *
+   * -   its **start**, which is all there is for a cohort that was never held;
+   * -   **release**, because `--hold` parks the viewer inside `peer_up` and the
+   *     clock is taken after that returns (`main.rs::watch_live_stream`). A
+   *     settled `--publish` run then spends the whole of `handle.joinable()`
+   *     between the last start and release — ffmpeg coming up and writing 8 s
+   *     of runway into Swarm — which is more than the straggler grace on its
+   *     own;
+   * -   the last **join**, because both run modes emit `joined` and only then
+   *     take the playback clock, and a live join waits up to 30 s for a
+   *     joinable window.
+   *
+   * Measuring from the start alone made the bound fire mid-measurement on
+   * exactly the configuration it was written to protect, killing a healthy
+   * cohort and reporting it as hung.
+   */
+  private stragglersOverdue(): boolean {
+    const durationS = this.scenario.durationS;
+    if (durationS === undefined || this.lastViewerStartMs === 0) {
+      return false;
+    }
+    const from = Math.max(this.lastViewerStartMs, this.measuredFromMs, this.lastViewerJoinMs);
+    const due = from + durationS * 1_000 + this.scenario.stragglerGraceS * 1_000;
+    return Date.now() >= due && this.totalActive() > 0;
   }
 
   /**
@@ -596,6 +669,9 @@ export class Controller {
 
       const outcome = await this.waitForOutcome(Math.min(stepEndsAt, deadlineMs));
       this.recordRampStep(target);
+      if (this.aborted) {
+        return;
+      }
       if (outcome !== undefined) {
         this.stoppedBecause = outcome;
         return;
@@ -619,6 +695,11 @@ export class Controller {
   private async waitForOutcome(untilMs: number): Promise<string | undefined> {
     while (Date.now() < untilMs) {
       await sleep(500);
+      // Checked first: a ramp step is up to `--ramp-interval` long, and an
+      // operator who pressed Ctrl-C should not wait it out.
+      if (this.aborted) {
+        return 'aborted';
+      }
 
       const guards = this.evaluateAllGuards();
       if (!guardsValid(guards)) {
@@ -679,7 +760,10 @@ export class Controller {
       link.channel.send({ kind: 'stop', graceMs: this.scenario.graceMs });
     }
     // Give viewers the grace period plus a little, so a viewer that handles
-    // SIGTERM can finish and emit its authoritative summary.
+    // SIGTERM can finish and emit its authoritative summary. The agent SIGKILLs
+    // anything still alive when the grace expires, so this wait ends either
+    // way — unless an agent has stopped reporting, in which case `active` is a
+    // stale number that will never reach zero and the timeout is the only exit.
     await this.waitFor(
       () => this.totalActive() === 0,
       this.scenario.graceMs + 10_000,
@@ -688,6 +772,7 @@ export class Controller {
   }
 
   private async collectAll(): Promise<void> {
+    this.closeViewerLogs();
     const remote = this.links.filter((link) => link.report.host !== 'local');
     if (remote.length === 0) {
       for (const link of this.links) {
@@ -709,6 +794,49 @@ export class Controller {
       link.channel.send({ kind: 'shutdown' });
       link.kill?.();
     }
+  }
+
+  /**
+   * Mirror one viewer's event stream to `viewers/<id>.ndjson` as it arrives.
+   *
+   * The agent keeps the authoritative copy on its own disk and `collect` ships
+   * it at the end of the run, which is better data — it has the lines this
+   * controller may have dropped, and the stderr log beside it. But it only
+   * exists if the run reaches its end, and the first real Vultr run did not:
+   * six hung viewers held the controller open past its ceiling, and when it was
+   * finally killed all 250 viewers' records went with it, having never touched
+   * a disk. Every machine sample survived, because those were streamed.
+   *
+   * So this is the same trade the sampler already makes: write continuously and
+   * be overwritten by something better later, rather than hold the only copy in
+   * memory until the end.
+   */
+  private appendViewerLine(viewerId: string, line: string): void {
+    let log = this.viewerLogs.get(viewerId);
+    if (log === undefined) {
+      log = createWriteStream(path.join(this.runDir, 'viewers', `${viewerId}.ndjson`), {
+        flags: 'a',
+      });
+      // A viewer whose log cannot be written must not take the run down with
+      // it; the agent's copy is still coming.
+      log.on('error', () => this.viewerLogs.delete(viewerId));
+      this.viewerLogs.set(viewerId, log);
+    }
+    log.write(`${line}\n`);
+  }
+
+  /**
+   * Close the live logs before `collect` replaces them.
+   *
+   * Writing an agent's authoritative file over a stream this process still has
+   * open interleaves the two, which would corrupt exactly the records the live
+   * copy exists to protect.
+   */
+  private closeViewerLogs(): void {
+    for (const log of this.viewerLogs.values()) {
+      log.end();
+    }
+    this.viewerLogs.clear();
   }
 
   private closeSampleLogs(): void {
@@ -753,9 +881,22 @@ export class Controller {
         link.started += 1;
         link.report.viewersStarted += 1;
         link.report.startTimestamps.push(message.agentClockMs);
+        // Controller-clock, so it can be compared with `Date.now()` without
+        // reasoning about which agent's offset applies.
+        this.lastViewerStartMs = Date.now();
         break;
       }
       case 'viewer_line': {
+        // Written before it is parsed, and regardless of whether it parses: a
+        // line this controller could not understand is exactly the line a
+        // person will want to read afterwards.
+        //
+        // Remote links only. A local agent's `outDir` *is* this run directory,
+        // so it is already writing this exact file itself; opening it here too
+        // would append every line twice.
+        if (link.report.host !== 'local') {
+          this.appendViewerLine(message.viewerId, message.line);
+        }
         const rollup = this.rollups.get(message.viewerId);
         if (rollup === undefined) {
           break;
@@ -770,6 +911,15 @@ export class Controller {
         }
         if (parsed.event.ev === 'segment') {
           this.throughput.record(Date.now(), parsed.event.bytes as number);
+        }
+        if (parsed.event.ev === 'joined') {
+          // The instant a viewer's `--duration` starts counting: both run modes
+          // emit `joined` and then immediately take the playback clock
+          // (`main.rs::play_live`, `main.rs::play`). Kept on the controller's
+          // own clock, because the straggler bound compares it with `Date.now()`
+          // — the viewer's `join_ms` is measured against its own start and, in
+          // the mock, against simulated time.
+          this.lastViewerJoinMs = Date.now();
         }
         rollup.apply(parsed.event);
         break;
@@ -1155,17 +1305,27 @@ export class Controller {
     }
   }
 
-  /** Emergency path: used by the CLI's signal handler. */
+  /**
+   * Signal handler path: stop the viewers, and let `run` write the report.
+   *
+   * It used to tear the agents down here as well — send `shutdown`, close the
+   * ssh pipe — which defeated its own purpose twice over. `run` was left
+   * blocked in a wait that did not test this flag, so nothing proceeded; and
+   * once the pipes were closed there was no agent left to `collect` from, so
+   * even if it had proceeded there would have been nothing to collect. What the
+   * operator asked for, and what the CLI says on screen, is "stop the viewers
+   * and write the report".
+   *
+   * So the flag is the whole mechanism: every long wait in the run loop tests
+   * it, returns, and falls into the ordinary `stopAll` / `collectAll` / report
+   * path. The CLI's second signal is the escape hatch if that path itself
+   * misbehaves.
+   */
   async abort(reason: string): Promise<void> {
     this.aborted = true;
     this.invalid(`aborted: ${reason}`);
     this.stoppedBecause = `aborted: ${reason}`;
-    this.stopTicking();
     await this.stopAll();
-    for (const link of this.links) {
-      link.channel.send({ kind: 'shutdown' });
-      link.kill?.();
-    }
   }
 }
 

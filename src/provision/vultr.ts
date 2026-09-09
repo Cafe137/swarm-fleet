@@ -102,8 +102,10 @@ export interface VultrClientOptions {
   baseUrl?: string | undefined;
   /** Floor between calls. 50 ms is 20/s against a documented ceiling of 30. */
   minIntervalMs?: number | undefined;
-  /** Attempts per call, for 429 and 5xx only. */
+  /** Attempts per call, for the statuses `isRetryable` allows. */
   retries?: number | undefined;
+  /** Attempts for a delete, which races the provider's install lock. */
+  deleteRetries?: number | undefined;
   sleep?: ((ms: number) => Promise<void>) | undefined;
 }
 
@@ -195,10 +197,21 @@ export class VultrClient {
     return VultrInstance.parse((body as { instance: unknown }).instance);
   }
 
-  /** Idempotent by intent: a 404 means it is already gone, which is the goal. */
+  /**
+   * Idempotent by intent: a 404 means it is already gone, which is the goal.
+   *
+   * Given a long retry budget because of what it is for. A rollback deletes
+   * instances that were created seconds earlier, and Vultr locks an instance
+   * while it installs — answering `409 Server is currently locked` for the
+   * first minute or so of its life. The default four attempts span under four
+   * seconds and lose that race, which leaves a rolled-back fleet billing. Ten
+   * attempts against the 8 s backoff cap span about fifty.
+   */
   async deleteInstance(id: string): Promise<'deleted' | 'absent'> {
     try {
-      await this.call('DELETE', `/instances/${encodeURIComponent(id)}`);
+      await this.call('DELETE', `/instances/${encodeURIComponent(id)}`, undefined, {
+        retries: this.options.deleteRetries ?? 10,
+      });
       return 'deleted';
     } catch (error) {
       if (error instanceof VultrError && error.status === 404) {
@@ -237,17 +250,28 @@ export class VultrClient {
     return out;
   }
 
-  private async call(method: string, path: string, body?: unknown): Promise<unknown> {
+  private async call(
+    method: string,
+    path: string,
+    body?: unknown,
+    options?: { retries?: number },
+  ): Promise<unknown> {
     // Chained rather than checked: two callers reading the same `nextCallAtMs`
     // would both find it clear and both fire.
-    const run = this.queue.then(() => this.callNow(method, path, body));
+    const run = this.queue.then(() => this.callNow(method, path, body, options));
     this.queue = run.catch(() => undefined);
     return run;
   }
 
-  private async callNow(method: string, path: string, body?: unknown): Promise<unknown> {
+  private async callNow(
+    method: string,
+    path: string,
+    body?: unknown,
+    options?: { retries?: number },
+  ): Promise<unknown> {
+    const retries = options?.retries ?? this.retries;
     let lastError: VultrError | undefined;
-    for (let attempt = 0; attempt <= this.retries; attempt += 1) {
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
       const wait = this.nextCallAtMs - Date.now();
       if (wait > 0) {
         await this.sleep(wait);
@@ -278,15 +302,29 @@ export class VultrClient {
 
       const message = extractError(text);
       lastError = new VultrError(message, response.status, method, path);
-      // 4xx other than 429 is a request this code got wrong; retrying re-sends
-      // the same mistake and, on POST /instances, could rent a second box.
-      if (response.status !== 429 && response.status < 500) {
+      if (!isRetryable(method, response.status)) {
         throw lastError;
       }
       await this.sleep(Math.min(8_000, 250 * 2 ** attempt));
     }
     throw lastError ?? new Error(`vultr ${method} ${path}: exhausted retries`);
   }
+}
+
+/**
+ * Which failures are worth re-sending.
+ *
+ * 4xx normally means this code got the request wrong, and re-sending a wrong
+ * `POST /instances` could rent a second box — so the default is to give up. The
+ * exception is a locked delete: `409 Server is currently locked` is Vultr
+ * saying "not yet", DELETE is idempotent, and abandoning it leaves an instance
+ * billing. That is the one 4xx this client re-sends.
+ */
+export function isRetryable(method: string, status: number): boolean {
+  if (status === 429 || status >= 500) {
+    return true;
+  }
+  return method === 'DELETE' && status === 409;
 }
 
 function extractError(text: string): string {

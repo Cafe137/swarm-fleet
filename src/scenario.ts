@@ -136,6 +136,8 @@ export const Scenario = z
     graceMs: z.number().nonnegative().default(15_000),
     /** Hard ceiling on the whole run, whatever the mode wants. */
     maxRunS: z.number().positive().optional(),
+    /** Seconds past its own duration before a viewer counts as hung. */
+    stragglerGraceS: z.number().positive().optional(),
     /** `flood` refuses to run without this. */
     acknowledgeFlood: z.boolean().default(false),
     runsDir: z.string().default('runs'),
@@ -156,6 +158,7 @@ export interface ResolvedScenario {
   stop: StopCondition;
   durationS: number | undefined;
   maxRunS: number;
+  stragglerGraceS: number;
   spec: ViewerSpec;
   admission: AdmissionConfig;
   agents: AgentTarget[];
@@ -290,6 +293,15 @@ export function resolveScenario(input: unknown): ResolvedScenario {
     stop: StopCondition.parse(scenario.stop ?? {}),
     durationS,
     maxRunS,
+    /**
+     * 30 s past a viewer's own duration is hung, not slow.
+     *
+     * A duration-bounded viewer ends itself, so the only question is how long
+     * to indulge one that has not. Held down deliberately: the alternative is
+     * `maxRunS`, which for a 120 s run is 720 s, and waiting that out is what
+     * cost the first Vultr fleet run every record it had collected.
+     */
+    stragglerGraceS: scenario.stragglerGraceS ?? 30,
     spec,
     admission,
     agents: scenario.agents,

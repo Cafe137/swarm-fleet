@@ -37,6 +37,7 @@ import { runMockViewer } from './mock/viewer.js';
 import { VultrClient } from './provision/vultr.js';
 import { capacityOf, choosePlan, demandFor, estimateCost, isDedicated, spreadRegions } from './provision/sizing.js';
 import { ensureSshKey } from './provision/ssh-key.js';
+import { agentsFromArgs } from './provision/agents.js';
 import {
   DEFAULT_SSH_USER,
   DEFAULT_STATE_DIR,
@@ -74,6 +75,7 @@ run options:
   --peers <n>            CONNECTION_BUILDUP_LIMIT per viewer  (default 200)
   --dial-rate <n>        connections/s a viewer may open, 0 = unpaced burst
   --agent <host>         repeatable; "local" runs in-process (default local)
+  --fleet <id>           machines from provision, with their ssh settings
   --ramp-start / --ramp-step / --ramp-interval / --ramp-max
   --stop-degraded <f>    degraded-viewer share that ends a ramp  (default 0.10)
   --stop-join <f>        join success below which a ramp ends    (default 0.95)
@@ -81,6 +83,8 @@ run options:
   --min-start-interval <ms>   floor between viewer starts        (default 250)
   --grace <ms>           time a viewer gets to finish after SIGTERM (default 15000)
   --max-run <s>          hard ceiling on the whole run
+  --straggler-grace <s>  seconds past its duration before a viewer is killed
+                         as hung, rather than waited for            (default 30)
   --sample-interval <ms> resource sampling period               (default 1000)
   --count-sockets        sample machine-wide TCP counts (port-ceiling does this anyway)
   --env <KEY=VALUE>      repeatable; passed to every viewer process
@@ -321,7 +325,7 @@ async function scenarioFromArgs(args: Args): Promise<unknown> {
     streams.push({ owner, topic });
   }
 
-  const agents = args.values('agent').map((host) => ({ host }));
+  const agents = await agentsFromArgs(args);
   const ramp = defined({
     start: args.number('ramp-start'),
     step: args.number('ramp-step'),
@@ -371,6 +375,7 @@ async function scenarioFromArgs(args: Args): Promise<unknown> {
     sampleIntervalMs: args.number('sample-interval'),
     graceMs: args.number('grace'),
     maxRunS: args.number('max-run'),
+    stragglerGraceS: args.number('straggler-grace'),
     runsDir: args.value('runs-dir'),
     live: args.has('vod') ? false : undefined,
     countSockets: args.has('count-sockets') ? true : undefined,
@@ -969,16 +974,13 @@ async function provisionCommand(args: Args): Promise<number> {
     return 0;
   }
 
-  const agentFlags = fleet.instances
-    .map((instance) => `--agent ${fleet.sshUser}@${instance.ip}`)
-    .join(' ');
   process.stdout.write(
     `\nfleet ${fleet.fleetId}: ${fleet.instances.length} machine(s) ready\n` +
       `${fleet.instances
         .map((instance) => `  ${instance.label.padEnd(30)} ${instance.ip.padEnd(16)} ${instance.region}`)
         .join('\n')}\n\n` +
       `run against them:\n` +
-      `  npx tsx src/cli.ts run ${agentFlags} \\\n` +
+      `  npx tsx src/cli.ts run --fleet ${fleet.fleetId} \\\n` +
       `    --deploy --from-github --publish --settle \\\n` +
       `    --viewers ${count * viewersPerBox} --peers ${peers} --duration 180\n\n` +
       `give them back (do not forget — they bill by the hour):\n` +

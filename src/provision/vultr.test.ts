@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { VultrClient, VultrError, type FetchLike } from './vultr.js';
+import { VultrClient, VultrError, isRetryable, type FetchLike } from './vultr.js';
 
 interface Call {
   url: string;
@@ -135,6 +135,43 @@ test('deleting something already gone is success, not an error', async () => {
     minIntervalMs: 0,
   });
   assert.equal(await other.deleteInstance('i-1'), 'deleted');
+});
+
+test('a locked delete is retried, because giving up leaves a box billing', async () => {
+  // What the first real provisioning run hit: three instances created, the
+  // fourth refused by an account limit, and the rollback could not delete two
+  // of the three because Vultr locks an instance while it installs.
+  assert.equal(isRetryable('DELETE', 409), true);
+  assert.equal(isRetryable('POST', 409), false, 'a retried create could rent a second box');
+  assert.equal(isRetryable('GET', 404), false);
+  assert.equal(isRetryable('POST', 429), true);
+  assert.equal(isRetryable('POST', 503), true);
+
+  const { fetch, calls } = fakeFetch([
+    json({ error: 'Server is currently locked' }, 409),
+    json({ error: 'Server is currently locked' }, 409),
+    new Response(null, { status: 204 }),
+  ]);
+  const client = new VultrClient({ apiKey: 'k', fetch, sleep: noSleep, minIntervalMs: 0 });
+
+  assert.equal(await client.deleteInstance('i-locked'), 'deleted');
+  assert.equal(calls.length, 3);
+});
+
+test('a delete gets a longer budget than the default four attempts', async () => {
+  // The install lock outlasts ~4 s of backoff, which is what the default spans.
+  const { fetch, calls } = fakeFetch([json({ error: 'Server is currently locked' }, 409)]);
+  const client = new VultrClient({
+    apiKey: 'k',
+    fetch,
+    sleep: noSleep,
+    minIntervalMs: 0,
+    retries: 1,
+    deleteRetries: 6,
+  });
+
+  await assert.rejects(client.deleteInstance('i-stuck'), /locked/);
+  assert.equal(calls.length, 7, 'delete uses deleteRetries, not retries');
 });
 
 test('concurrent callers queue behind the rate gate rather than racing it', async () => {

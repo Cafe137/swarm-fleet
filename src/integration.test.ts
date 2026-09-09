@@ -249,3 +249,149 @@ test('settle and ramp are refused together', () => {
     /settle and ramp are alternatives/,
   );
 });
+
+/**
+ * A held viewer's duration clock starts at release, and the bound has to agree.
+ *
+ * The straggler bound was measured from the last viewer's *start*, but a viewer
+ * under `--hold` parks inside `peer_up` and only takes its playback clock once
+ * released. Everything a settled run does in between — for `--publish`, the
+ * whole of `handle.joinable()`: ffmpeg coming up and writing 8 s of runway into
+ * Swarm — was therefore charged against the viewers' own duration, so the bound
+ * came due before they had watched anything and a healthy cohort was killed
+ * mid-measurement and reported as hung.
+ *
+ * The delay here stands in for that publisher wait, and is longer than
+ * `durationS + stragglerGraceS` on purpose: that is precisely the window the
+ * old bound got wrong.
+ */
+test('a settled cohort is not charged for the time it spent held', async () => {
+  const publisherStartupMs = 5_000;
+  const scenario = resolveScenario({
+    mode: 'cohort',
+    binary: 'mock',
+    streams: [{ owner: 'aabb', topic: 'ccdd' }],
+    viewers: 2,
+    durationS: 2,
+    stragglerGraceS: 1,
+    settle: { peerUp: 20, timeoutS: 30 },
+    peerLimit: 20,
+    admission: { minStartIntervalMs: 10, startJitterMs: 0 },
+    sampleIntervalMs: 250,
+    graceMs: 1_000,
+    maxRunS: 120,
+    env: FAST_ENV,
+  });
+  const runsDir = await mkdtemp(path.join(os.tmpdir(), 'swarm-fleet-test-'));
+  const id = runId(scenario.label);
+  const dir = await createRunDir(runsDir, id);
+
+  let settledAtMs = 0;
+  const controller = new Controller(scenario, id, dir, {
+    onSettled: async () => {
+      settledAtMs = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, publisherStartupMs));
+    },
+  });
+  const result = await controller.run(false);
+
+  // The delay was real, or the test is no longer exercising anything.
+  assert.ok(settledAtMs > 0, 'the cohort never settled');
+
+  assert.match(result.stoppedBecause, /finished/);
+  assert.doesNotMatch(result.stoppedBecause, /hung/);
+  assert.ok(
+    !result.invalidBecause.some((reason) => /outliving their duration/.test(reason)),
+    result.invalidBecause.join('; '),
+  );
+  // Killed viewers lose their summary, so a full set of them is the other half
+  // of the claim: these two watched to the end of their own duration.
+  assert.equal(result.kpis.viewers.started, 2);
+  assert.equal(result.kpis.viewers.byOutcome.completed, 2);
+});
+
+// The shutdown tests live last on purpose. They spawn viewers that ignore
+// SIGTERM, and `machine_idle` refuses a box that is already busy — so leaving
+// their load in front of another test's preflight makes that test flaky for a
+// reason that has nothing to do with what it checks.
+
+/**
+ * The four failures that lost the first Vultr fleet run.
+ *
+ * 250 viewers watched a live mainnet stream for their full 120 s and the rig
+ * threw all of it away: six viewers never ended, the run loop waited for them
+ * instead of stopping them, the abort path did not interrupt that wait, and
+ * every viewer record was held in memory until a `collect` that never came.
+ */
+test('viewers that outlive their duration are stopped, not waited for', async () => {
+  const started = Date.now();
+  const { result, dir } = await runScenario({
+    viewers: 3,
+    segments: undefined,
+    durationS: 1,
+    stragglerGraceS: 2,
+    graceMs: 1_000,
+    // A ceiling far beyond the straggler bound, so the timing says which one
+    // ended the run: waiting for the ceiling would take two minutes.
+    maxRunS: 120,
+    env: { ...FAST_ENV, MOCK_HANG: '1', MOCK_IGNORE_SIGTERM: '1' },
+  });
+
+  const elapsedS = (Date.now() - started) / 1000;
+  assert.ok(elapsedS < 30, `run took ${elapsedS.toFixed(1)}s; the straggler bound did not fire`);
+  assert.match(result.stoppedBecause, /stopped as hung/);
+
+  // A killed viewer never emitted its summary, so the run cannot claim to
+  // describe the fleet it names.
+  assert.equal(result.valid, false);
+  assert.ok(
+    result.invalidBecause.some((reason) => /outliving their duration/.test(reason)),
+    result.invalidBecause.join('; '),
+  );
+
+  // A viewer that had to be killed still leaves the events it emitted before
+  // it hung, because they were written as they arrived.
+  const files = await readdir(path.join(dir, 'viewers'));
+  assert.ok(files.some((file) => file.endsWith('.ndjson')), `no viewer records in ${files.join()}`);
+});
+
+test('abort interrupts the run loop instead of waiting it out', async () => {
+  const scenario = resolveScenario({
+    mode: 'cohort',
+    binary: 'mock',
+    streams: [{ owner: 'aabb', topic: 'ccdd' }],
+    viewers: 2,
+    durationS: 300,
+    // Hung viewers with a straggler grace beyond the ceiling: nothing but the
+    // abort can end this run, which is the point.
+    stragglerGraceS: 600,
+    admission: { minStartIntervalMs: 10, startJitterMs: 0 },
+    sampleIntervalMs: 250,
+    graceMs: 2_000,
+    maxRunS: 600,
+    env: { ...FAST_ENV, MOCK_HANG: '1' },
+  });
+  const runsDir = await mkdtemp(path.join(os.tmpdir(), 'swarm-fleet-test-'));
+  const id = runId(scenario.label);
+  const dir = await createRunDir(runsDir, id);
+  const controller = new Controller(scenario, id, dir, {});
+
+  const running = controller.run(false);
+  // Long enough for both viewers to be up and emitting.
+  await new Promise((resolve) => setTimeout(resolve, 2_000));
+
+  const started = Date.now();
+  await controller.abort('SIGINT');
+  const result = await running;
+  const elapsedS = (Date.now() - started) / 1000;
+
+  // The bug: `driveFixed` waited on a condition that never tested `aborted`,
+  // so Ctrl-C did nothing until the run's own ceiling — 600 s here.
+  assert.ok(elapsedS < 60, `abort took ${elapsedS.toFixed(1)}s to be noticed`);
+  assert.match(result.stoppedBecause, /aborted/);
+  assert.equal(result.valid, false);
+
+  // And it still reported: an aborted run is a short run, not a lost one.
+  const files = await readdir(path.join(dir, 'viewers'));
+  assert.ok(files.some((file) => file.endsWith('.ndjson')), `no viewer records in ${files.join()}`);
+});

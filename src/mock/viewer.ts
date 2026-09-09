@@ -46,6 +46,7 @@ export interface MockConfig {
   peerLimit: number;
   runwaySeconds: number;
   ignoreTerminate: boolean;
+  hang: boolean;
 }
 
 export interface MockArgs {
@@ -116,6 +117,10 @@ export function mockConfigFromEnv(env: Record<string, string | undefined>): Mock
     peerLimit: number('MOCK_PEERS', 200),
     runwaySeconds: number('MOCK_RUNWAY_SECONDS', 8),
     ignoreTerminate: env['MOCK_IGNORE_SIGTERM'] === '1',
+    // Never finish on its own, so the runner's straggler handling has
+    // something to handle. With MOCK_IGNORE_SIGTERM it takes a SIGKILL, which
+    // is what the six hung viewers on the first Vultr run needed.
+    hang: env['MOCK_HANG'] === '1',
   };
 }
 
@@ -264,8 +269,8 @@ export async function runMockViewer(
   const fetchSamples: number[] = [];
 
   const deadlineS = args.durationS;
-  while (played < wanted && !terminating) {
-    if (deadlineS !== undefined && elapsed() >= deadlineS) {
+  while ((played < wanted || config.hang) && !terminating) {
+    if (!config.hang && deadlineS !== undefined && elapsed() >= deadlineS) {
       break;
     }
     if (peers < peerLimit) {
