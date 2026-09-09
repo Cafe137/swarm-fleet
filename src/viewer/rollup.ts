@@ -72,6 +72,11 @@ export interface ViewerRecord {
 
   peersLast?: number | undefined;
   peersMax?: number | undefined;
+  /** Peers held at the barrier, and how long the hold lasted. */
+  heldAtPeers?: number | undefined;
+  held?: boolean | undefined;
+  releasedAtMs?: number | undefined;
+  heldMs?: number | undefined;
   dialFailures: number;
   feedIndexLast?: number | undefined;
   finalized: boolean;
@@ -109,6 +114,7 @@ export class ViewerRollup {
     this.record = {
       ...identity,
       outcome: 'running',
+      held: false,
       joined: false,
       segments: 0,
       bytes: 0,
@@ -176,6 +182,20 @@ export class ViewerRollup {
           this.record.dialFailures,
           (event.dial_failures as number) ?? 0,
         );
+        break;
+      }
+      case 'held': {
+        this.record.held = true;
+        this.record.heldAtPeers = event.peers as number;
+        this.record.peersLast = event.peers as number;
+        this.record.peersMax = Math.max(this.record.peersMax ?? 0, event.peers as number);
+        break;
+      }
+      case 'released': {
+        this.record.held = false;
+        this.record.heldMs = event.held_ms as number;
+        this.record.peersLast = event.peers as number;
+        this.record.peersMax = Math.max(this.record.peersMax ?? 0, event.peers as number);
         break;
       }
       case 'joined': {

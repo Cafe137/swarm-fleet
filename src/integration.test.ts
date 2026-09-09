@@ -159,3 +159,93 @@ test('one stream across many viewers is flagged as a popularity test', async () 
   assert.equal(spread.result.kpis.distinctContentRatio, 1);
   assert.doesNotMatch(spread.result.caveats.join(' '), /forwarding-node caching/);
 });
+
+test('a settled cohort peers in full, is released together, and measures only after', async () => {
+  const runsDir = await mkdtemp(path.join(os.tmpdir(), 'swarm-fleet-test-'));
+  const scenario = resolveScenario({
+    mode: 'cohort',
+    binary: 'mock',
+    streams: [{ owner: 'aabb', topic: 'ccdd' }],
+    segments: 6,
+    viewers: 4,
+    peerLimit: 40,
+    settle: { timeoutS: 20 },
+    admission: { minStartIntervalMs: 10, startJitterMs: 0 },
+    sampleIntervalMs: 250,
+    graceMs: 3_000,
+    maxRunS: 60,
+    env: FAST_ENV,
+  });
+  assert.deepEqual(scenario.settle, { peerUp: 40, timeoutS: 20 });
+  assert.equal(scenario.spec.hold, true);
+  assert.equal(scenario.spec.peerUp, 40);
+
+  const id = runId(scenario.label);
+  const dir = await createRunDir(runsDir, id);
+  // The stream would start here in a publishing run. Recording when it was
+  // called is what proves the ordering: the audience is in place first.
+  let settledAt: number | undefined;
+  let heldWhenSettled = 0;
+  const controller = new Controller(scenario, id, dir, {
+    onSettled: async () => {
+      settledAt = Date.now();
+      heldWhenSettled = 4;
+    },
+  });
+  const result = await controller.run(false);
+
+  assert.equal(result.valid, true, result.invalidBecause.join('; '));
+  assert.equal(result.kpis.viewers.started, 4);
+  assert.equal(result.kpis.viewers.byOutcome.completed, 4);
+  assert.equal(heldWhenSettled, 4);
+  assert.ok(settledAt !== undefined, 'onSettled ran');
+
+  // The barrier held every viewer at its full peer footprint, and each was
+  // released rather than releasing itself on a closed stdin.
+  for (const record of result.records) {
+    assert.ok((record.heldAtPeers ?? 0) >= 40, `${record.viewerId} held at ${record.heldAtPeers}`);
+    assert.equal(record.held, false, `${record.viewerId} was released`);
+    assert.ok((record.heldMs ?? 0) > 0);
+  }
+
+  // The measurement window excludes the settle phase, so it is shorter than
+  // the run, and the KPI rates are divided by it rather than by the whole run.
+  assert.ok(result.settleS > 0);
+  const summary = buildSummary(result);
+  assert.ok(
+    summary.measuredS < summary.durationS,
+    `measured ${summary.measuredS}s of a ${summary.durationS}s run`,
+  );
+  assert.match(renderReport(summary), /settling the cohort/);
+  assert.deepEqual(
+    result.caveats.filter((caveat) => caveat.includes('released before it had settled')),
+    [],
+  );
+});
+
+test('a settle phase that times out releases anyway and says so', async () => {
+  const { result } = await runScenario({
+    viewers: 2,
+    peerLimit: 40,
+    // Nothing can reach 400 peers, so the deadline is what releases the cohort.
+    settle: { peerUp: 400, timeoutS: 2 },
+  });
+
+  assert.match(result.caveats.join(' '), /released before it had settled/);
+  assert.equal(result.kpis.viewers.started, 2);
+  // Released and measured regardless: a shortfall is a caveat, not a failure.
+  assert.equal(result.kpis.viewers.byOutcome.completed, 2);
+});
+
+test('settle and ramp are refused together', () => {
+  assert.throws(
+    () =>
+      resolveScenario({
+        mode: 'ramp',
+        binary: 'mock',
+        streams: [{ owner: 'aa', topic: 'bb' }],
+        settle: true,
+      }),
+    /settle and ramp are alternatives/,
+  );
+});

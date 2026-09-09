@@ -42,6 +42,32 @@ export const PeersEvent = z
   })
   .passthrough();
 
+/**
+ * The viewer has its peers and is parked at the `--hold` barrier.
+ *
+ * This is the readiness signal a settled cohort waits on: it means the viewer
+ * is done dialing *and* has not touched the stream yet.
+ */
+export const HeldEvent = z
+  .object({
+    ...stamped,
+    ev: z.literal('held'),
+    peers: z.number().int().nonnegative(),
+    peer_up: z.number().int().nonnegative().optional(),
+  })
+  .passthrough();
+
+export const ReleasedEvent = z
+  .object({
+    ...stamped,
+    ev: z.literal('released'),
+    peers: z.number().int().nonnegative(),
+    held_ms: z.number().nonnegative(),
+    /** `released on stdin` for a real release; anything else voided the hold. */
+    reason: z.string().default('released'),
+  })
+  .passthrough();
+
 export const JoinedEvent = z
   .object({
     ...stamped,
@@ -153,6 +179,8 @@ export const UnknownEvent = z.object({ ...stamped, ev: z.string() }).passthrough
 export const ViewerEvent = z.union([
   StartEvent,
   PeersEvent,
+  HeldEvent,
+  ReleasedEvent,
   JoinedEvent,
   SegmentEvent,
   BodyFailureEvent,
@@ -166,6 +194,8 @@ export const ViewerEvent = z.union([
 
 export type StartEvent = z.infer<typeof StartEvent>;
 export type PeersEvent = z.infer<typeof PeersEvent>;
+export type HeldEvent = z.infer<typeof HeldEvent>;
+export type ReleasedEvent = z.infer<typeof ReleasedEvent>;
 export type JoinedEvent = z.infer<typeof JoinedEvent>;
 export type SegmentEvent = z.infer<typeof SegmentEvent>;
 export type BodyFailureEvent = z.infer<typeof BodyFailureEvent>;
@@ -183,6 +213,8 @@ export type ParseResult =
 const KNOWN_EVENTS = new Set([
   'start',
   'peers',
+  'held',
+  'released',
   'joined',
   'segment',
   'body_failure',

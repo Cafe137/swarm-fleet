@@ -94,6 +94,25 @@ export const ViewerSpec = z.object({
   dialRate: z.number().int().nonnegative().optional(),
   durationS: z.number().positive().optional(),
   segments: z.number().int().positive().optional(),
+  /**
+   * Peers a viewer holds before its first request, and whether it then parks
+   * until the controller says go.
+   *
+   * The pair is what a settled cohort is made of: `peerUp` at the full peer
+   * limit means no viewer is still dialing while another retrieves, and `hold`
+   * means none of them starts watching until all of them are ready.
+   */
+  peerUp: z.number().int().positive().optional(),
+  hold: z.boolean().default(false),
+  /**
+   * Whether viewers check retrieved chunks against their content addresses.
+   *
+   * The viewer's own default is off (`--unsafe`), because the BMT is 8.3% of a
+   * viewer's CPU, measured. It travels in the spec rather than being left to
+   * the binary's default so that every run records which one it ran, and the
+   * report can say that CPU per viewer is below a real client's.
+   */
+  verifyChunks: z.boolean().default(false),
   streams: z.array(StreamRef).min(1),
   assignment: z.enum(['all', 'round-robin']),
   env: z.record(z.string()).default({}),
@@ -144,6 +163,11 @@ export const SetTarget = z.object({
   concurrent: z.number().int().nonnegative(),
   totalStarts: z.number().int().nonnegative(),
 });
+/**
+ * Open the barrier on every viewer this agent holds, and on every one it starts
+ * from here on — a cohort released mid-ramp must not park the stragglers.
+ */
+export const Release = z.object({ kind: z.literal('release') });
 export const Stop = z.object({ kind: z.literal('stop'), graceMs: z.number().nonnegative() });
 export const Collect = z.object({ kind: z.literal('collect') });
 export const Shutdown = z.object({ kind: z.literal('shutdown') });
@@ -152,6 +176,7 @@ export const Ping = z.object({ kind: z.literal('ping'), id: z.number().int(), co
 export const ToAgent = z.discriminatedUnion('kind', [
   Configure,
   SetTarget,
+  Release,
   Stop,
   Collect,
   Shutdown,
@@ -219,6 +244,8 @@ export const AgentState = z.object({
   startsExhausted: z.boolean().default(false),
   active: z.number().int(),
   bootstrapping: z.number().int(),
+  /** Viewers peered and parked at the barrier, waiting to be released. */
+  held: z.number().int().default(0),
   started: z.number().int(),
   exited: z.number().int(),
   admissionReason: z.string().optional(),

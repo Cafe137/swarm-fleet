@@ -70,6 +70,59 @@ npx tsx src/cli.ts run --mode cohort --viewers 6 --binary mock --segments 20 \
 | `flood` | N at once, no stagger. Needs `--acknowledge-flood` | join storms. Marked **not comparable** |
 | `port-ceiling` | one machine, ramp until dials fail | "how many viewers before a box runs out of ports?" |
 
+### `--verify` / `--unsafe`: what a viewer costs, versus what it costs honestly
+
+Viewers do **not** verify retrieved chunk content by default (`--unsafe`), because the BMT over
+each 4 KB chunk is 8.3% of a viewer's CPU — measured on 6-core x86 over 8 interleaved pairs,
+0.1268 against 0.1382 CPU-seconds per MB. On a box where CPU binds before bandwidth, that is
+~10 more viewers.
+
+It is a real trade and every run records it. `--unsafe` runs carry a standing caveat, because:
+
+-   viewer CPU is then ~8% below what a real browser client pays, so density figures are
+    optimistic by about that much;
+-   a peer answering with well-formed *wrong* bytes is believed. Absence still retries — a peer
+    without the chunk replies empty and the length check catches that — but corruption would
+    show up as a decode error rather than as a body failure in the KPIs.
+
+Feed updates are authenticated either way, so the playlist is always the stream owner's. Pass
+`--verify` when the question is what a real viewer costs rather than how many fit.
+
+### `--settle`: peer the cohort before it watches
+
+```sh
+npx tsx src/cli.ts run --viewers 50 --duration 300 --settle --agent box-a --publish
+```
+
+Without it a cohort's ramp is inside its own measurement. Admission control admits a viewer
+only while the box has CPU left for another join, so a large cohort takes a minute or more to
+be fully up — during which viewers that are already retrieving share a thread with viewers
+still verifying certificate chains, and the reported throughput is divided by a window that
+contains the ramp.
+
+`--settle` splits the run in two:
+
+1.  Every viewer starts, dials to its **full** peer limit (not the 25 peers it needs to begin),
+    and parks at a barrier. The live view's `held` column counts them.
+2.  Once they are all there, the stream starts — a `--publish` run does not launch ffmpeg until
+    this moment — and the barrier opens on every viewer at once.
+
+The report then carries the settle phase and the measured window separately, and every rate is
+over the measured window alone. A cohort that could not settle inside `--settle-timeout`
+(default 300 s) is released anyway and the shortfall is recorded as a caveat, because 49 of 50
+viewers peered is still worth measuring as long as nobody reads it as a clean cohort.
+
+| | |
+| --- | --- |
+| `--settle-peers <n>` | peers to hold before release. Defaults to `--peers` |
+| `--settle-timeout <s>` | release anyway after this long |
+| `--no-settle` | the default: viewers watch as they come up |
+
+It is refused with `--mode ramp`, which deliberately starts viewers during the measurement, so
+there is no moment at which the cohort is complete. **Unsettled is a flash-crowd test; settled
+is a steady-state capacity test** — see `IMPROVEMENTS.md` for what each one is and is not
+measuring.
+
 A ramp stops when a KPI breach *holds* for `--hold` seconds — `--stop-degraded` (default
 0.10) or `--stop-join` (default 0.95). One slow segment across 200 viewers is weather, not
 a cliff.

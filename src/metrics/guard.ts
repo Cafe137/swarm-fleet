@@ -42,6 +42,21 @@ export interface GuardInput {
   dialFailureSeries: readonly number[];
   /** Viewers bootstrapping at each sample, parallel to `dialFailureSeries`. */
   bootstrappingSeries?: readonly number[] | undefined;
+  /**
+   * When the measurement window opened, for a run with a settle phase.
+   *
+   * `cpu_headroom` is judged from here. A settled cohort concentrates every
+   * join into one window on purpose — 20 viewers dialing 200 peers each is
+   * 4,000 certificate chains — and that burst saturated a 6-core box at 99.6%
+   * while *nothing was being measured*. Failing the run for it would report the
+   * generator's own start-up as the network's limit, which is the one thing the
+   * guards exist to prevent, backwards.
+   *
+   * Only CPU is scoped this way. Memory is not: a peak RSS is a peak RSS
+   * whenever it happened, and a box that nearly ran out of memory settling
+   * would not have survived the measurement either.
+   */
+  measuredFromMs?: number | undefined;
 }
 
 /**
@@ -65,20 +80,34 @@ export function guardsValid(verdicts: readonly GuardVerdict[]): boolean {
   return verdicts.every((verdict) => verdict.status !== 'breached');
 }
 
-function cpuHeadroom({ machine, samples }: GuardInput): GuardVerdict {
+function cpuHeadroom({ machine, samples, measuredFromMs }: GuardInput): GuardVerdict {
   const threshold = machine.cores * GUARD_CPU_LOAD_FRACTION;
-  const breach = sustained(samples, (sample) => sample.loadAvg1 > threshold);
-  const worst = samples.reduce((peak, sample) => Math.max(peak, sample.loadAvg1), 0);
-  if (samples.length === 0) {
-    return { name: 'cpu_headroom', status: 'no_data', detail: 'no samples' };
+  const judged =
+    measuredFromMs === undefined
+      ? samples
+      : samples.filter((sample) => sample.atMs >= measuredFromMs);
+  const excluded = samples.length - judged.length;
+  const breach = sustained(judged, (sample) => sample.loadAvg1 > threshold);
+  const worst = judged.reduce((peak, sample) => Math.max(peak, sample.loadAvg1), 0);
+  if (judged.length === 0) {
+    return {
+      name: 'cpu_headroom',
+      status: 'no_data',
+      detail: samples.length === 0 ? 'no samples' : 'no samples inside the measurement window',
+    };
   }
+  // Load average is a one-minute average, so the settle phase's burst decays
+  // into the first samples after the release however the window is cut. Saying
+  // how many samples were excluded is what lets a reader see that.
+  const scope = excluded > 0 ? `, ${excluded} settle-phase samples excluded` : '';
   return {
     name: 'cpu_headroom',
     status: breach === undefined ? 'ok' : 'breached',
     detail:
       breach === undefined
-        ? `peak load ${worst.toFixed(2)} of ${machine.cores} cores`
-        : `load stayed above ${threshold.toFixed(1)} for ${GUARD_SUSTAIN_SAMPLES} samples (peak ${worst.toFixed(2)})`,
+        ? `peak load ${worst.toFixed(2)} of ${machine.cores} cores${scope}`
+        : `load stayed above ${threshold.toFixed(1)} for ${GUARD_SUSTAIN_SAMPLES} samples ` +
+          `(peak ${worst.toFixed(2)})${scope}`,
     value: worst,
     threshold,
     firstBreachAtMs: breach,

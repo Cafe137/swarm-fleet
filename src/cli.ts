@@ -73,6 +73,14 @@ run options:
                          (e.g. --env WEEB_3_CHUNK_CACHE=32)
   --label <name>         names the run directory
   --runs-dir <dir>       where run directories go                (default runs)
+  --verify               check every chunk against its content address; 8.3%
+                         more CPU per viewer, and what a real client pays
+  --unsafe               skip that check                      (the default)
+  --settle               peer every viewer to its full footprint and hold it
+                         there; start the stream and release them together
+  --settle-peers <n>     peers to hold before release        (default --peers)
+  --settle-timeout <s>   release anyway after this long      (default 300)
+  --no-settle            start viewers watching as they come up (the default)
   --publish              publish a live stream for this run and watch it
   --publish-source <s>   testsrc, or a media file           (default testsrc)
   --publish-duration <s> stream length; omit to run until the fleet stops
@@ -157,6 +165,8 @@ async function runFleet(args: Args): Promise<number> {
     ...(quiet ? {} : { onSnapshot: (snapshot) => view.render(snapshot) }),
     // Through the view, so a log does not land inside the block it redraws.
     onLog: (level, message) => view.log(`${level}: ${message}`),
+    // A settled run publishes only once its audience is in place.
+    onSettled: () => published.start(),
   });
 
   process.stderr.write(
@@ -192,7 +202,7 @@ async function runFleet(args: Args): Promise<number> {
     // The publisher outlives a failed run only long enough to be told to stop:
     // an ffmpeg left encoding into Swarm is both a cost and a contaminated
     // measurement for whatever runs next.
-    const stats = await stopPublisher(published.handle);
+    const stats = await stopPublisher(published.handle());
     if (stats !== undefined) {
       await writeJson(path.join(dir, 'publisher.json'), stats);
       process.stderr.write(
@@ -260,6 +270,20 @@ async function scenarioFromArgs(args: Args): Promise<unknown> {
     env[entry.slice(0, at)] = entry.slice(at + 1);
   }
 
+  // `--settle` on its own is the whole feature; the two knobs are for a box
+  // that needs longer than the default to peer a large cohort.
+  const settle: Record<string, number> = {};
+  const settlePeers = args.number('settle-peers');
+  const settleTimeout = args.number('settle-timeout');
+  if (settlePeers !== undefined) {
+    settle['peerUp'] = settlePeers;
+  }
+  if (settleTimeout !== undefined) {
+    settle['timeoutS'] = settleTimeout;
+  }
+  const settleRequested =
+    args.has('settle') || settlePeers !== undefined || settleTimeout !== undefined;
+
   const overrides: Partial<Scenario> = defined({
     mode: (args.value('mode') ?? base['mode'] ?? 'cohort') as Scenario['mode'],
     label: args.value('label'),
@@ -277,10 +301,16 @@ async function scenarioFromArgs(args: Args): Promise<unknown> {
     runsDir: args.value('runs-dir'),
     live: args.has('vod') ? false : undefined,
     countSockets: args.has('count-sockets') ? true : undefined,
+    verifyChunks: args.has('verify') ? true : args.has('unsafe') ? false : undefined,
     acknowledgeFlood: args.has('acknowledge-flood') ? true : undefined,
     ...(streams.length > 0 ? { streams } : {}),
     ...(agents.length > 0 ? { agents } : {}),
     ...(Object.keys(ramp).length > 0 ? { ramp } : {}),
+    ...(args.has('no-settle')
+      ? { settle: false }
+      : settleRequested
+        ? { settle: Object.keys(settle).length > 0 ? settle : true }
+        : {}),
     ...(Object.keys(stop).length > 0 ? { stop } : {}),
     ...(Object.keys(admission).length > 0 ? { admission } : {}),
     ...(Object.keys(env).length > 0 ? { env } : {}),
@@ -367,12 +397,12 @@ async function runMock(argv: readonly string[]): Promise<number> {
  */
 async function startPublisherForRun(
   scenario: Scenario,
-): Promise<{ scenario: Scenario; handle: PublisherHandle | undefined }> {
+): Promise<{ scenario: Scenario; start: () => Promise<void>; handle: () => PublisherHandle | undefined }> {
   const requested = scenario.publisher;
   if (requested === undefined) {
-    return { scenario, handle: undefined };
+    return { scenario, start: async () => undefined, handle: () => undefined };
   }
-  const config = PublisherConfig.parse(requested);
+  const parsed = PublisherConfig.parse(requested);
   if (scenario.agents.some((agent) => agent.host === 'local')) {
     process.stderr.write(
       'publisher: this machine will both encode video and host viewers. Encoding costs ' +
@@ -382,26 +412,42 @@ async function startPublisherForRun(
     );
   }
 
-  const { startPublisher } = await import('./publisher/control.js');
-  const handle = await startPublisher(config, (level, message) =>
-    process.stderr.write(`publisher: ${level === 'warn' ? 'warn: ' : ''}${message}\n`),
-  );
+  const control = await import('./publisher/control.js');
+  const { stream, config } = control.planStream(parsed);
+  const log = (level: 'info' | 'warn', message: string): void =>
+    void process.stderr.write(`publisher: ${level === 'warn' ? 'warn: ' : ''}${message}\n`);
 
-  // Viewers cannot join a live edge that has no runway behind it, so the run
-  // waits here rather than starting viewers that would all report a join
-  // latency describing the publisher.
-  const needed = segmentsBeforeViewersCanJoin(config);
-  const timeoutMs = Math.max(60_000, needed * config.segmentDuration * 2_000 + 30_000);
-  try {
-    await handle.joinable(timeoutMs);
-  } catch (error) {
-    await handle.stop();
-    throw error;
+  let handle: PublisherHandle | undefined;
+  const start = async (): Promise<void> => {
+    if (handle !== undefined) {
+      return;
+    }
+    handle = await control.startPublisher(config, log);
+    // Viewers cannot join a live edge that has no runway behind it, so the run
+    // waits here rather than starting viewers that would all report a join
+    // latency describing the publisher.
+    const needed = segmentsBeforeViewersCanJoin(config);
+    const timeoutMs = Math.max(60_000, needed * config.segmentDuration * 2_000 + 30_000);
+    try {
+      await handle.joinable(timeoutMs);
+    } catch (error) {
+      await handle.stop();
+      throw error;
+    }
+  };
+
+  // A settled run starts the stream from the controller's `onSettled`, once
+  // every viewer is peered and parked. Any other run starts it here, because
+  // its viewers begin watching the moment they come up and a stream that does
+  // not exist yet is a join failure rather than a wait.
+  if (scenario.settle === undefined || scenario.settle === false) {
+    await start();
   }
 
   return {
-    scenario: { ...scenario, streams: [handle.stream, ...scenario.streams] },
-    handle,
+    scenario: { ...scenario, publisher: config, streams: [stream, ...scenario.streams] },
+    start,
+    handle: () => handle,
   };
 }
 

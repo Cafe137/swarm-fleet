@@ -26,5 +26,23 @@ await runMockViewer(args, {
   onTerminate: (handler) => {
     terminate = handler;
   },
+  // The same barrier the native viewer implements: one line on stdin. A closed
+  // stdin releases too, so a mock spawned without the pipe is not stuck.
+  awaitRelease: () =>
+    new Promise<string>((resolve) => {
+      let seen = false;
+      const done = (why: string): void => {
+        if (!seen) {
+          seen = true;
+          process.stdin.pause();
+          resolve(why);
+        }
+      };
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', () => done('released on stdin'));
+      process.stdin.on('end', () => done('stdin closed'));
+      process.stdin.on('error', () => done('stdin unreadable'));
+      process.stdin.resume();
+    }),
 });
 process.exit(0);

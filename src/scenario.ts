@@ -43,6 +43,35 @@ export const RampConfig = z.object({
 });
 export type RampConfig = z.infer<typeof RampConfig>;
 
+/**
+ * The settle phase: peer the whole cohort, then start it watching together.
+ *
+ * Without it a run's ramp is inside its own measurement. Admission control
+ * admits a viewer only while the box has CPU for another join, so a large
+ * cohort takes a minute or more to be fully up — during which viewers that are
+ * already retrieving share a thread with viewers still verifying certificate
+ * chains, and `aggregateMbps` divides the run's bytes by a window that includes
+ * the ramp. Settling separates the two: every viewer holds its full peer
+ * footprint at the barrier, the publisher starts once they are all there, and
+ * the barrier opens on all of them at once.
+ *
+ * `peerUp` defaults to the run's `peerLimit`, which is the point — a viewer
+ * released while still dialing is the overlap this exists to remove.
+ */
+export const SettleConfig = z.object({
+  /** Peers each viewer holds before it is released. Defaults to `peerLimit`. */
+  peerUp: z.number().int().positive().optional(),
+  /**
+   * How long to wait for the cohort to settle before releasing it anyway.
+   *
+   * Releasing anyway rather than failing: a run that has 49 of 50 viewers
+   * peered is still worth measuring, and the shortfall is recorded as a caveat
+   * so nobody reads it as a clean cohort.
+   */
+  timeoutS: z.number().positive().default(300),
+});
+export type SettleConfig = z.infer<typeof SettleConfig>;
+
 export const MODES = ['cohort', 'ramp', 'soak', 'flood', 'port-ceiling'] as const;
 export type Mode = (typeof MODES)[number];
 
@@ -54,6 +83,8 @@ export const Scenario = z
     durationS: z.number().positive().optional(),
     segments: z.number().int().positive().optional(),
     ramp: RampConfig.partial().optional(),
+    /** Peer the whole cohort before any of it starts watching. */
+    settle: z.union([z.boolean(), SettleConfig.partial()]).optional(),
     stop: StopCondition.partial().optional(),
     /**
      * Empty is legal only alongside `publisher`, which supplies the stream it
@@ -74,6 +105,16 @@ export const Scenario = z
      * on a box packed with viewers the peak is what breaches `cpu_headroom`.
      */
     dialRate: z.number().int().nonnegative().optional(),
+    /**
+     * Verify every retrieved chunk against its content address.
+     *
+     * Off by default, matching the viewer. It is 8.3% of a viewer's CPU on
+     * x86, so leaving it off is how a run gets the density the rig is for —
+     * but it means the run's CPU figures are below a real browser client's,
+     * and a peer sending well-formed wrong bytes would not have been caught.
+     * Every run says which way it ran.
+     */
+    verifyChunks: z.boolean().default(false),
     binary: z.string().default('../weeb-3-rs-hls/target/release/weeb-3-rs-hls'),
     agents: z.array(AgentTarget).default([{ host: 'local', weight: 1 }]),
     admission: z
@@ -108,6 +149,8 @@ export interface ResolvedScenario {
   /** Peak viewers this run will ever ask for. Sizes preflight. */
   peakViewers: number;
   ramp: RampConfig | undefined;
+  /** Set when the cohort peers and waits before it watches. */
+  settle: (SettleConfig & { peerUp: number }) | undefined;
   stop: StopCondition;
   durationS: number | undefined;
   maxRunS: number;
@@ -171,6 +214,16 @@ export function resolveScenario(input: unknown): ResolvedScenario {
   const publisher =
     scenario.publisher === undefined ? undefined : PublisherConfig.parse(scenario.publisher);
   const caveats: string[] = [];
+  if (!scenario.verifyChunks) {
+    caveats.push(
+      'chunk content verification was off (--unsafe, the viewer default), so viewer CPU here ' +
+        'is 8.3% below what a real browser client pays — measured on 6-core x86 over eight ' +
+        'interleaved pairs, 0.1268 against 0.1382 CPU-seconds per MB. Density figures from ' +
+        'this run are therefore optimistic by about that much, and a peer returning ' +
+        'well-formed wrong bytes would not have been detected. Pass --verify to measure what ' +
+        'a real viewer costs.',
+    );
+  }
   if (publisher !== undefined && scenario.agents.some((agent) => agent.host === 'local')) {
     caveats.push(
       'the publisher ran on a machine that also hosted viewers. Encoding video costs ' +
@@ -179,6 +232,24 @@ export function resolveScenario(input: unknown): ResolvedScenario {
         'with no agent before believing any stall or join figure from this run.',
     );
   }
+
+  // A ramp adds viewers on purpose while the run is measuring, so there is no
+  // moment when the cohort is "all there" to release. Refusing is better than
+  // quietly settling the first step and calling it a ramp.
+  const settleRequested = scenario.settle !== undefined && scenario.settle !== false;
+  if (settleRequested && ramp !== undefined) {
+    throw new Error(
+      'settle and ramp are alternatives: a ramp deliberately starts viewers during the ' +
+        'measurement, so there is no point at which the cohort is complete and can be ' +
+        'released together. Use --mode cohort to settle, or drop --settle to ramp.',
+    );
+  }
+  const settle = settleRequested
+    ? (() => {
+        const parsed = SettleConfig.parse(scenario.settle === true ? {} : scenario.settle);
+        return { ...parsed, peerUp: parsed.peerUp ?? scenario.peerLimit };
+      })()
+    : undefined;
 
   const spec: ViewerSpec = {
     binary: scenario.binary,
@@ -190,6 +261,9 @@ export function resolveScenario(input: unknown): ResolvedScenario {
     assignment: scenario.assignment,
     env: scenario.env,
     extraArgs: scenario.extraArgs,
+    hold: settle !== undefined,
+    verifyChunks: scenario.verifyChunks,
+    ...(settle === undefined ? {} : { peerUp: settle.peerUp }),
     ...(durationS === undefined ? {} : { durationS }),
     ...(scenario.segments === undefined ? {} : { segments: scenario.segments }),
   };
@@ -198,14 +272,19 @@ export function resolveScenario(input: unknown): ResolvedScenario {
     ramp === undefined
       ? 0
       : (Math.ceil((ramp.max - ramp.start) / ramp.step) + 1) * ramp.intervalS;
+  // The settle phase is not part of the run's ceiling: a cohort that took two
+  // minutes to peer must still get its full duration afterwards.
+  const settleS = settle === undefined ? 0 : settle.timeoutS;
   const maxRunS =
-    scenario.maxRunS ?? (ramp === undefined ? (durationS ?? 600) + 300 : rampTotalS + 300);
+    scenario.maxRunS ??
+    (ramp === undefined ? (durationS ?? 600) + 300 + settleS : rampTotalS + 300);
 
   return {
     mode: scenario.mode,
     label: scenario.label ?? `${scenario.mode}-${peakViewers}`,
     peakViewers,
     ramp,
+    settle,
     stop: StopCondition.parse(scenario.stop ?? {}),
     durationS,
     maxRunS,

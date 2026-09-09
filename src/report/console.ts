@@ -169,6 +169,11 @@ export class ConsoleView {
       `${pc.dim('joined')} ${snapshot.joined}`,
       `${pc.dim('bootstrapping')} ${snapshot.bootstrapping}`,
     ];
+    // Only while settling, and second from the left: during that phase it is
+    // the number the operator is actually waiting on.
+    if ((snapshot.held ?? 0) > 0) {
+      parts.splice(2, 0, `${pc.dim('held')} ${pc.bold(String(snapshot.held))}`);
+    }
     if (snapshot.exited > 0) {
       parts.push(`${pc.dim('exited')} ${snapshot.exited}`);
     }
@@ -361,6 +366,7 @@ type MachineColumn =
   | 'host'
   | 'viewers'
   | 'bootstrapping'
+  | 'held'
   | 'cpu'
   | 'load'
   | 'mem'
@@ -382,6 +388,7 @@ export function machineCells(agent: AgentSnapshot): Cells<MachineColumn> {
     host: agent.name,
     viewers: `${agent.active}/${agent.target}`,
     bootstrapping: String(agent.bootstrapping),
+    held: (agent.held ?? 0) === 0 ? '-' : String(agent.held),
     cpu: percent(agent.cpuUtilisation),
     // Load against the machine's core count, because 4.2 means nothing until
     // you know whether the box has 4 cores or 64.
@@ -405,6 +412,9 @@ const MACHINE_COLUMNS: Column<MachineColumn>[] = [
   { key: 'host', head: 'host', width: 20, flex: { min: 20, floor: 10, max: 28 } },
   { key: 'viewers', head: 'viewers', width: 9 },
   { key: 'bootstrapping', head: 'booting', width: 9, drop: 3 },
+  // First to go when the terminal is narrow: it is only ever non-zero during
+  // the settle phase, and the headline carries the same number.
+  { key: 'held', head: 'held', width: 7, drop: 6 },
   { key: 'cpu', head: 'cpu', width: 8 },
   { key: 'load', head: 'load', width: 9, drop: 4 },
   { key: 'mem', head: 'mem', width: 8, drop: 2 },

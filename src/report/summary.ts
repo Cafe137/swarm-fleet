@@ -15,6 +15,13 @@ export interface RunSummary {
   label: string;
   mode: string;
   startedAt: string;
+  /**
+   * Seconds spent peering the cohort before it was released, and the window the
+   * KPIs are actually divided by. Zero and equal to `durationS` for a run with
+   * no settle phase.
+   */
+  settleS: number;
+  measuredS: number;
   endedAt: string;
   durationS: number;
   stoppedBecause: string;
@@ -97,6 +104,8 @@ export function buildSummary(result: RunResult): RunSummary {
     mode: result.mode,
     startedAt: new Date(result.startedAtMs).toISOString(),
     endedAt: new Date(result.endedAtMs).toISOString(),
+    settleS: result.settleS,
+    measuredS: (result.endedAtMs - result.measuredFromMs) / 1000,
     durationS: result.durationS,
     stoppedBecause: result.stoppedBecause,
     verdict: {

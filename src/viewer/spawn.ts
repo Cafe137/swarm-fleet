@@ -35,6 +35,15 @@ export interface ViewerHandle {
   peerLimit: number;
   live: boolean;
   argv: readonly string[];
+  /**
+   * Open the viewer's `--hold` barrier. A no-op for a viewer not holding.
+   *
+   * The go-ahead is a line on stdin rather than a signal: SIGUSR1 is reserved
+   * by Node, so the mock viewer could not have honoured the same mechanism, and
+   * a barrier the fake viewer cannot implement is a barrier the runner's own
+   * tests cannot cover.
+   */
+  release(): void;
   /** SIGTERM the process group, then SIGKILL it after `graceMs`. */
   stop(graceMs: number): void;
   /** Whether the exit we are about to see was asked for. */
@@ -72,6 +81,15 @@ export function viewerArgs(spec: ViewerSpec, stream: StreamRef): string[] {
   if (spec.dialRate !== undefined) {
     args.push('--dial-rate', String(spec.dialRate));
   }
+  if (spec.peerUp !== undefined) {
+    args.push('--peer-up', String(spec.peerUp));
+  }
+  if (spec.hold) {
+    args.push('--hold');
+  }
+  // Passed either way, so the argv in the run directory says which it was
+  // rather than leaving it to whatever the binary defaults to that week.
+  args.push(spec.verifyChunks ? '--verify' : '--unsafe');
   args.push(...spec.extraArgs);
   if (spec.network === 'testnet') {
     args.push('testnet');
@@ -114,7 +132,11 @@ export function launchViewer(launch: ViewerLaunch, hooks: ViewerHooks): ViewerHa
     // spawned and a killed controller cannot leave 200 mainnet connections
     // per viewer behind.
     detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    // stdin is the release channel, and only a holding viewer reads it. Left
+    // as a pipe for every viewer it would be an idle fd per process and an
+    // EPIPE to explain; left as `ignore` for a holding one, the viewer sees
+    // stdin closed and releases itself immediately.
+    stdio: [spec.hold ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     env: { ...process.env, ...spec.env },
   });
 
@@ -122,6 +144,7 @@ export function launchViewer(launch: ViewerLaunch, hooks: ViewerHooks): ViewerHa
   const log = createWriteStream(`${outDir}/${viewerId}.log`, { flags: 'a' });
   const stderrTail: string[] = [];
   let requested = false;
+  let released = !spec.hold;
   let killTimer: NodeJS.Timeout | undefined;
 
   readLines(child, 'stdout', (line) => {
@@ -162,6 +185,20 @@ export function launchViewer(launch: ViewerLaunch, hooks: ViewerHooks): ViewerHa
     },
     get stderrTail() {
       return stderrTail;
+    },
+    release() {
+      if (released) {
+        return;
+      }
+      released = true;
+      const stdin = child.stdin;
+      if (stdin === null) {
+        return;
+      }
+      // Ending stdin as well as writing to it: the viewer needs one line, and
+      // a still-open pipe would keep an fd per viewer for the rest of the run.
+      stdin.on('error', () => undefined);
+      stdin.end('go\n');
     },
     stop(graceMs: number) {
       if (requested) {

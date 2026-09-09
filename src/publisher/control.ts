@@ -22,9 +22,30 @@
  *     check will refuse such a run unless it is forced.
  */
 
-import { publishLive, type PublishEvent } from './publisher.js';
+import { randomUUID } from 'node:crypto';
+import { publishLive, type PublishEvent, resolveSigner } from './publisher.js';
 import { type PublisherConfig, segmentsBeforeViewersCanJoin } from './config.js';
 import type { StreamRef } from '../transport/protocol.js';
+
+/**
+ * What this configuration *will* publish, without publishing anything.
+ *
+ * The owner is the signer's address and the topic is a UUID, so both are known
+ * before ffmpeg exists. That is what lets a settled run launch its viewers
+ * first and start encoding only once they are all peered and parked: the
+ * viewers need the `owner:topic` pair at launch, not a running stream.
+ *
+ * The returned config carries the topic explicitly, so the publisher that
+ * eventually starts writes to the feed the viewers are already watching rather
+ * than rolling a fresh UUID of its own.
+ */
+export function planStream(config: PublisherConfig): { stream: StreamRef; config: PublisherConfig } {
+  const topic = config.topic ?? randomUUID();
+  return {
+    stream: { owner: resolveSigner().publicKey().address().toHex(), topic },
+    config: { ...config, topic },
+  };
+}
 
 export interface PublisherStats {
   owner: string;

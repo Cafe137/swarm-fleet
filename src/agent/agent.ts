@@ -46,6 +46,8 @@ interface TrackedViewer {
   handle: ViewerHandle;
   startedAtMs: number;
   joined: boolean;
+  /** Peered and parked at the barrier. Cleared when it is released. */
+  held: boolean;
   lastCpuSeconds?: number | undefined;
   lastSampleAtMs?: number | undefined;
 }
@@ -69,6 +71,14 @@ export class FleetAgent {
   private started = 0;
   private exited = 0;
   private stopping = false;
+  /**
+   * Whether the controller has opened the barrier.
+   *
+   * Sticky, because it also governs viewers started *after* the release: a
+   * cohort released while one machine is still admitting must not park the
+   * stragglers behind a barrier nobody will open again.
+   */
+  private released = false;
   private launchTimer: NodeJS.Timeout | undefined;
   private lastAdmissionReason: string | undefined;
 
@@ -105,6 +115,9 @@ export class FleetAgent {
         this.totalStarts = message.totalStarts;
         this.pokeLauncher(0);
         this.reportState();
+        break;
+      case 'release':
+        this.release();
         break;
       case 'stop':
         this.stop(message.graceMs);
@@ -215,7 +228,10 @@ export class FleetAgent {
       },
     );
 
-    this.viewers.set(viewerId, { handle, startedAtMs: nowMs, joined: false });
+    this.viewers.set(viewerId, { handle, startedAtMs: nowMs, joined: false, held: false });
+    if (this.released) {
+      handle.release();
+    }
     this.channel.send({
       kind: 'viewer_started',
       agent: this.name,
@@ -259,16 +275,41 @@ export class FleetAgent {
 
   private onViewerLine(viewerId: string, line: string): void {
     const viewer = this.viewers.get(viewerId);
-    if (viewer !== undefined && !viewer.joined) {
+    if (viewer !== undefined && !(viewer.joined && !viewer.held)) {
       const parsed = parseViewerEvent(line);
-      // `segment` as well as `joined`: a VOD viewer never joins a live edge but
-      // is plainly past bootstrap once it is pulling bodies.
-      if (parsed.ok && (parsed.event.ev === 'joined' || parsed.event.ev === 'segment')) {
-        viewer.joined = true;
-        this.pokeLauncher(0);
+      if (parsed.ok) {
+        // `held` ends bootstrap as surely as `joined` does, and more precisely:
+        // the viewer says it has finished dialing. `segment` counts too, since
+        // a VOD viewer never joins a live edge but is plainly past bootstrap
+        // once it is pulling bodies.
+        if (
+          parsed.event.ev === 'joined' ||
+          parsed.event.ev === 'segment' ||
+          parsed.event.ev === 'held'
+        ) {
+          viewer.joined = true;
+          viewer.held = parsed.event.ev === 'held';
+          this.pokeLauncher(0);
+          if (viewer.held) {
+            this.reportState();
+          }
+        } else if (parsed.event.ev === 'released') {
+          viewer.held = false;
+          this.reportState();
+        }
       }
     }
     this.channel.send({ kind: 'viewer_line', agent: this.name, viewerId, line });
+  }
+
+  /** Open every barrier this machine is holding, now and later. */
+  private release(): void {
+    this.released = true;
+    for (const viewer of this.viewers.values()) {
+      viewer.handle.release();
+    }
+    this.log('info', `released ${this.viewers.size} viewer(s)`);
+    this.reportState();
   }
 
   private onViewerExit(
@@ -434,6 +475,7 @@ export class FleetAgent {
       startsExhausted: this.started >= this.totalStarts,
       active: this.viewers.size,
       bootstrapping: state.bootstrapping,
+      held: [...this.viewers.values()].filter((viewer) => viewer.held).length,
       started: this.started,
       exited: this.exited,
       ...(this.lastAdmissionReason === undefined

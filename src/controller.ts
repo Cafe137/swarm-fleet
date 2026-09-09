@@ -75,6 +75,8 @@ export interface LiveSnapshot {
   target: number;
   active: number;
   bootstrapping: number;
+  /** Viewers peered and parked at the barrier, during a settle phase. */
+  held?: number | undefined;
   started: number;
   exited: number;
   joined: number;
@@ -103,6 +105,7 @@ export interface AgentSnapshot {
   target: number;
   active: number;
   bootstrapping: number;
+  held?: number | undefined;
   cores?: number | undefined;
   cpuUtilisation?: number | undefined;
   loadAvg1?: number | undefined;
@@ -122,8 +125,18 @@ export interface RunResult {
   label: string;
   mode: string;
   startedAtMs: number;
+  /**
+   * When the cohort was released and the measurement actually began.
+   *
+   * Equal to `startedAtMs` for a run with no settle phase. The KPI window is
+   * measured from here, because dividing a run's bytes by a window that
+   * includes its own ramp reports a throughput no viewer ever saw.
+   */
+  measuredFromMs: number;
   endedAtMs: number;
   durationS: number;
+  /** Seconds spent peering and parked before the barrier opened. */
+  settleS: number;
   stoppedBecause: string;
   valid: boolean;
   comparable: boolean;
@@ -145,6 +158,7 @@ interface AgentLink {
   startsExhausted: boolean;
   active: number;
   bootstrapping: number;
+  held: number;
   started: number;
   exited: number;
   admissionReason?: string | undefined;
@@ -165,6 +179,13 @@ interface AgentLink {
 export interface ControllerHooks {
   onSnapshot?: (snapshot: LiveSnapshot) => void;
   onLog?: (level: 'info' | 'warn' | 'error', message: string) => void;
+  /**
+   * Called once the settled cohort is peered and parked, before the barrier
+   * opens. This is where a run that publishes its own stream starts ffmpeg: the
+   * viewers are all there, so nothing is published that nobody watches and no
+   * viewer spends its join budget polling a feed that does not exist yet.
+   */
+  onSettled?: () => Promise<void>;
 }
 
 export class Controller {
@@ -174,6 +195,11 @@ export class Controller {
   private readonly rampSteps: RampStep[] = [];
   private readonly invalidBecause: string[] = [];
   private startedAtMs = 0;
+  /** When the barrier opened. Equal to `startedAtMs` without a settle phase. */
+  private measuredFromMs = 0;
+  /** Caveats observed during the run, alongside the scenario's own. */
+  private readonly observedCaveats: string[] = [];
+  private aborted = false;
   private requested = 0;
   private stoppedBecause = 'not started';
   private breachSinceMs: number | undefined;
@@ -188,6 +214,7 @@ export class Controller {
 
   async run(force: boolean): Promise<RunResult> {
     this.startedAtMs = Date.now();
+    this.measuredFromMs = this.startedAtMs;
     await this.connect();
     await this.measureClocks();
     await this.configure();
@@ -268,6 +295,7 @@ export class Controller {
         startsExhausted: false,
         active: 0,
         bootstrapping: 0,
+        held: 0,
         started: 0,
         exited: 0,
         dialFailureSeries: [],
@@ -466,8 +494,9 @@ export class Controller {
     // Viewers here are bounded by segments or a duration, so they finish on
     // their own and must not be replaced when they do.
     this.setTotalTarget(total, 'none');
+    await this.settleAndRelease(total);
 
-    const deadline = this.startedAtMs + this.scenario.maxRunS * 1_000;
+    const deadline = this.measuredFromMs + this.scenario.maxRunS * 1_000;
     // Viewers bounded by `--segments` or `--duration` end on their own; the
     // run is over when every requested viewer has started and none is left.
     const spent = (): boolean =>
@@ -481,6 +510,80 @@ export class Controller {
       spent() && this.totalActive() === 0
         ? `every one of ${this.totalStarted()} viewers finished`
         : `hit the ${this.scenario.maxRunS}s run ceiling`;
+  }
+
+  /**
+   * Peer the whole cohort, start the stream, then start every viewer watching
+   * at the same instant.
+   *
+   * The wait is on the viewers' own `held` events rather than on a delay: each
+   * says when it has its peers and has parked, which is the only signal that
+   * actually means "done dialing". A viewer that falls short of the target is
+   * not fatal — the phase has a deadline, and a shortfall is recorded rather
+   * than being allowed to hang a run that is otherwise fine.
+   */
+  private async settleAndRelease(total: number): Promise<void> {
+    const settle = this.scenario.settle;
+    if (settle === undefined) {
+      return;
+    }
+    const capacity = this.links.reduce((sum, link) => sum + link.report.maxViewers, 0);
+    const target = Math.min(total, capacity);
+    this.hooks.onLog?.(
+      'info',
+      `settling: waiting for ${target} viewers to hold ${settle.peerUp} peers each`,
+    );
+
+    const ready = (): ViewerRecord[] =>
+      this.records().filter(
+        (record) => record.held && (record.peersLast ?? 0) >= settle.peerUp,
+      );
+    await this.waitFor(
+      () => this.aborted || (this.totalStarted() >= target && ready().length >= target),
+      settle.timeoutS * 1_000,
+      undefined,
+    );
+    if (this.aborted) {
+      return;
+    }
+
+    // What is actually being released, recorded before the publisher starts so
+    // a shortfall survives even if the publisher then fails.
+    const held = ready().length;
+    const settleS = (Date.now() - this.startedAtMs) / 1000;
+    if (held < target) {
+      const lowest = this.records()
+        .filter((record) => record.outcome === 'running')
+        .map((record) => record.peersLast ?? 0)
+        .sort((left, right) => left - right)[0];
+      const detail =
+        `${held} of ${target} viewers were holding ${settle.peerUp} peers after ` +
+        `${settleS.toFixed(0)}s (${this.totalStarted()} started, lowest peer count ` +
+        `${lowest ?? 0})`;
+      this.caveat(
+        `the cohort was released before it had settled: ${detail}. Joining and watching ` +
+          'therefore overlapped for some viewers, which is the overlap settling exists to ' +
+          'remove — raise settle.timeoutS, lower the viewer count, or add a machine.',
+      );
+      this.hooks.onLog?.('warn', `settle deadline reached: ${detail}`);
+    } else {
+      this.hooks.onLog?.(
+        'info',
+        `settled: ${target} viewers holding ${settle.peerUp} peers after ${settleS.toFixed(0)}s`,
+      );
+    }
+
+    // The stream starts now, with the audience already in place.
+    if (this.hooks.onSettled !== undefined) {
+      this.hooks.onLog?.('info', 'starting the stream');
+      await this.hooks.onSettled();
+    }
+
+    this.measuredFromMs = Date.now();
+    for (const link of this.links) {
+      link.channel.send({ kind: 'release' });
+    }
+    this.hooks.onLog?.('info', 'released; the measurement window starts here');
   }
 
   private async driveRamp(): Promise<void> {
@@ -685,6 +788,7 @@ export class Controller {
       case 'state':
         link.active = message.active;
         link.bootstrapping = message.bootstrapping;
+        link.held = message.held;
         link.startsExhausted = message.startsExhausted;
         link.admissionReason = message.admissionReason;
         break;
@@ -766,7 +870,7 @@ export class Controller {
   }
 
   private liveKpis(): CohortKpis {
-    const elapsed = (Date.now() - this.startedAtMs) / 1000;
+    const elapsed = (Date.now() - this.measuredFromMs) / 1000;
     return cohortKpis(this.records(), this.requested, elapsed);
   }
 
@@ -797,6 +901,9 @@ export class Controller {
         clockRttMs: link.report.clockRttMs,
         dialFailureSeries: link.dialFailureSeries,
         bootstrappingSeries: link.bootstrappingSeries,
+        // Only set for a settled run: elsewhere it equals the run's start and
+        // scopes nothing.
+        ...(this.scenario.settle === undefined ? {} : { measuredFromMs: this.measuredFromMs }),
       });
       link.report.guards = guards;
       verdicts.push(...guards.map((guard) => ({ ...guard, name: `${link.report.name}/${guard.name}` })));
@@ -820,6 +927,7 @@ export class Controller {
       target: link.target,
       active: link.active,
       bootstrapping: link.bootstrapping,
+      held: link.held,
       cores: machine?.cores,
       cpuUtilisation: sample?.cpuUtilisation,
       loadAvg1: sample?.loadAvg1,
@@ -844,6 +952,7 @@ export class Controller {
         target: this.links.reduce((total, link) => total + link.target, 0),
         active: this.totalActive(),
         bootstrapping: this.links.reduce((total, link) => total + link.bootstrapping, 0),
+        held: this.links.reduce((total, link) => total + link.held, 0),
         started: this.totalStarted(),
         exited: this.links.reduce((total, link) => total + link.exited, 0),
         joined: kpis.viewers.joined,
@@ -870,6 +979,16 @@ export class Controller {
   private invalid(reason: string): void {
     if (!this.invalidBecause.includes(reason)) {
       this.invalidBecause.push(reason);
+    }
+  }
+
+  /**
+   * Something that makes a number here mean less than it appears to, but does
+   * not make the run worthless. `invalid` is for the latter.
+   */
+  private caveat(reason: string): void {
+    if (!this.observedCaveats.includes(reason)) {
+      this.observedCaveats.push(reason);
     }
   }
 
@@ -913,8 +1032,12 @@ export class Controller {
   private finish(): RunResult {
     const endedAtMs = Date.now();
     const durationS = (endedAtMs - this.startedAtMs) / 1000;
+    const settleS = (this.measuredFromMs - this.startedAtMs) / 1000;
     const records = this.records();
-    const kpis = cohortKpis(records, this.requested, durationS);
+    // KPIs are measured from the release, not from the process start: byte and
+    // segment rates divided by a window that includes the settle phase would
+    // report a throughput no viewer ever saw.
+    const kpis = cohortKpis(records, this.requested, (endedAtMs - this.measuredFromMs) / 1000);
     const guards = this.evaluateAllGuards();
     for (const guard of guards.filter((verdict) => verdict.status === 'breached')) {
       this.invalid(`guard ${guard.name}: ${guard.detail}`);
@@ -959,8 +1082,10 @@ export class Controller {
       label: this.scenario.label,
       mode: this.scenario.mode,
       startedAtMs: this.startedAtMs,
+      measuredFromMs: this.measuredFromMs,
       endedAtMs,
       durationS,
+      settleS,
       stoppedBecause: this.stoppedBecause,
       valid: this.invalidBecause.length === 0,
       comparable: this.scenario.comparable,
@@ -982,7 +1107,7 @@ export class Controller {
    */
   private caveats(records: readonly ViewerRecord[], kpis: CohortKpis): string[] {
     // Scenario-level caveats first: they are true before the run starts.
-    const caveats: string[] = [...this.scenario.caveats];
+    const caveats: string[] = [...this.scenario.caveats, ...this.observedCaveats];
     if (this.scenario.spec.binary === MOCK_BINARY) {
       caveats.push(
         'ran against the built-in mock viewer: this measures the rig, not Swarm.',
@@ -1032,6 +1157,7 @@ export class Controller {
 
   /** Emergency path: used by the CLI's signal handler. */
   async abort(reason: string): Promise<void> {
+    this.aborted = true;
     this.invalid(`aborted: ${reason}`);
     this.stoppedBecause = `aborted: ${reason}`;
     this.stopTicking();

@@ -21,6 +21,13 @@ export interface MockIo {
   now(): number;
   sleep(ms: number): Promise<void>;
   onTerminate(handler: () => void): void;
+  /**
+   * Resolves when the `--hold` barrier opens, with why it opened.
+   *
+   * Absent means "release immediately", which is what a caller that does not
+   * model the barrier wants. The real viewer reads a line on stdin here.
+   */
+  awaitRelease?: () => Promise<string>;
 }
 
 export interface MockConfig {
@@ -48,6 +55,8 @@ export interface MockArgs {
   segments: number;
   durationS: number | undefined;
   peerLimit: number | undefined;
+  peerUp: number | undefined;
+  hold: boolean;
   networkId: number;
   metricsJson: boolean;
 }
@@ -75,6 +84,8 @@ export function parseMockArgs(argv: readonly string[]): MockArgs | undefined {
     segments: numeric('--segments') ?? 8,
     durationS: numeric('--duration'),
     peerLimit: numeric('--peers'),
+    peerUp: numeric('--peer-up'),
+    hold: argv.includes('--hold'),
     networkId: argv.includes('testnet') ? 10 : 1,
     metricsJson: value('--metrics') === 'json',
   };
@@ -173,12 +184,14 @@ export async function runMockViewer(
     });
   }
 
-  // Peer up. The real viewer waits for 25 peers before asking the network for
-  // anything, and keeps dialing toward its limit while it watches.
+  // Peer up. The real viewer waits for `--peer-up` peers — 25 unless a fleet
+  // raises it — before asking the network for anything, and keeps dialing
+  // toward its limit while it watches.
   let peers = 0;
   let dialFailures = 0;
+  const peerTarget = Math.min(args.peerUp ?? 25, peerLimit);
   const peerStep = Math.max(config.peersRampMs / 10, 1);
-  while (peers < 25 && !terminating) {
+  while (peers < peerTarget && !terminating) {
     await sleepSim(peerStep);
     peers = Math.min(peerLimit, Math.round((simMs() / config.peersRampMs) * peerLimit));
     emit({ ev: 'peers', peers, dial_failures: dialFailures });
@@ -186,6 +199,34 @@ export async function runMockViewer(
   if (terminating) {
     emitSummary();
     return;
+  }
+
+  // The barrier. Peers keep arriving while held, as they do in the real viewer:
+  // the node goes on dialing toward its limit whatever the run is waiting for.
+  if (args.hold) {
+    const heldAt = simMs();
+    emit({ ev: 'held', peers, peer_up: peerTarget });
+    io.human(`mock viewer: held at ${peers} peers`);
+    let reason = 'released';
+    if (io.awaitRelease !== undefined) {
+      const release = io.awaitRelease().then((why) => {
+        reason = why;
+      });
+      let settled = false;
+      void release.then(() => {
+        settled = true;
+      });
+      while (!settled && !terminating) {
+        await Promise.race([release, sleepSim(1_000)]);
+        peers = Math.min(peerLimit, Math.round((simMs() / config.peersRampMs) * peerLimit));
+        emit({ ev: 'peers', peers, dial_failures: dialFailures });
+      }
+    }
+    emit({ ev: 'released', peers, held_ms: Math.round(simMs() - heldAt), reason });
+    if (terminating) {
+      emitSummary();
+      return;
+    }
   }
 
   if (random() < config.joinFailRate) {

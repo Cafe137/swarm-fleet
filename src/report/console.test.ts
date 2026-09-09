@@ -64,6 +64,7 @@ test('a machine line carries what would end a run', () => {
     host: 'box-a',
     viewers: '18/20',
     bootstrapping: '0',
+    held: '-',
     cpu: '23.4%',
     load: '1.8/8',
     mem: '14.0%',

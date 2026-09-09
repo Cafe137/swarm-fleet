@@ -9,8 +9,13 @@ export function renderReport(summary: RunSummary): string {
   lines.push(`# ${summary.label}`);
   lines.push('');
   lines.push(
-    `\`${summary.mode}\` run \`${summary.runId}\`, ${summary.durationS.toFixed(0)}s. ` +
-      `Stopped because: ${summary.stoppedBecause}.`,
+    `\`${summary.mode}\` run \`${summary.runId}\`, ${summary.durationS.toFixed(0)}s` +
+      (summary.settleS > 0
+        ? ` — ${summary.settleS.toFixed(0)}s settling the cohort, then ` +
+          `${summary.measuredS.toFixed(0)}s measured. Rates below are over the measured ` +
+          'window, not the whole run.'
+        : '.') +
+      ` Stopped because: ${summary.stoppedBecause}.`,
   );
   lines.push('');
 

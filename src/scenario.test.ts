@@ -29,6 +29,25 @@ test('a publishing run supplies its own stream, so it needs none up front', () =
   assert.equal(scenario.publisher?.windowSize, 10);
 });
 
+/** Every scenario carries the unverified-chunks caveat by default; skip it. */
+function publisherCaveats(caveats: readonly string[]): string[] {
+  return caveats.filter((caveat) => !caveat.includes('chunk content verification'));
+}
+
+test('an unverified run says so, because its CPU figures are optimistic', () => {
+  const unsafe = resolveScenario({ ...base, streams: [{ owner: 'aa', topic: 'bb' }] });
+  assert.equal(unsafe.spec.verifyChunks, false);
+  assert.match(unsafe.caveats.join(' '), /chunk content verification was off/);
+
+  const verified = resolveScenario({
+    ...base,
+    streams: [{ owner: 'aa', topic: 'bb' }],
+    verifyChunks: true,
+  });
+  assert.equal(verified.spec.verifyChunks, true);
+  assert.deepEqual(verified.caveats, []);
+});
+
 test('a publisher sharing a machine with viewers is a standing caveat', () => {
   const shared = resolveScenario({
     ...base,
@@ -44,12 +63,12 @@ test('a publisher sharing a machine with viewers is a standing caveat', () => {
     publisher: {},
     agents: [{ host: 'box-a' }],
   });
-  assert.deepEqual(separate.caveats, []);
+  assert.deepEqual(publisherCaveats(separate.caveats), []);
 
   // No publisher, no caveat, whatever the agents are.
   const plain = resolveScenario({ ...base, streams: [{ owner: 'aa', topic: 'bb' }] });
   assert.equal(plain.publisher, undefined);
-  assert.deepEqual(plain.caveats, []);
+  assert.deepEqual(publisherCaveats(plain.caveats), []);
 });
 
 test('viewers wait for as much runway as the viewer actually needs', () => {

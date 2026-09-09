@@ -38,6 +38,7 @@ function guards(overrides: {
   clockOffsetMs?: number;
   clockRttMs?: number;
   admissionDisabled?: boolean;
+  measuredFromMs?: number;
 }) {
   return evaluateGuards({
     machine,
@@ -51,6 +52,9 @@ function guards(overrides: {
       ? {}
       : { bootstrappingSeries: overrides.bootstrappingSeries }),
     ...(overrides.clockRttMs === undefined ? {} : { clockRttMs: overrides.clockRttMs }),
+    ...(overrides.measuredFromMs === undefined
+      ? {}
+      : { measuredFromMs: overrides.measuredFromMs }),
   });
 }
 
@@ -75,6 +79,37 @@ test('cpu load has to stay high to count, not merely spike', () => {
   const breached = verdict('cpu_headroom', { samples: sustained });
   assert.equal(breached.status, 'breached');
   assert.equal(breached.firstBreachAtMs, 0);
+});
+
+test('a settled run is judged on its measurement window, not on its join burst', () => {
+  // A 6-core box at 99.6% while 20 viewers dial 200 peers each, then a quiet
+  // measurement. Measured, on 192.99.166.13.
+  const settling = [0, 1, 2, 3].map((at) => sample({ atMs: at * 1_000, loadAvg1: 20 }));
+  const measuring = [4, 5, 6, 7].map((at) => sample({ atMs: at * 1_000, loadAvg1: 1 }));
+  const samples = [...settling, ...measuring];
+
+  // Unscoped, the burst fails the run and the numbers it protects were never
+  // affected by it.
+  assert.equal(verdict('cpu_headroom', { samples }).status, 'breached');
+
+  const scoped = verdict('cpu_headroom', { samples, measuredFromMs: 4_000 });
+  assert.equal(scoped.status, 'ok');
+  assert.equal(scoped.value, 1);
+  assert.match(scoped.detail, /4 settle-phase samples excluded/);
+
+  // Saturation *inside* the window still fails, whatever the settle phase did.
+  const stillBusy = [...settling, ...[4, 5, 6, 7].map((at) => sample({ atMs: at * 1_000, loadAvg1: 20 }))];
+  assert.equal(
+    verdict('cpu_headroom', { samples: stillBusy, measuredFromMs: 4_000 }).status,
+    'breached',
+  );
+
+  // Memory is deliberately not scoped: a peak RSS is a peak RSS.
+  const heavy = settling.map((entry) => ({ ...entry, viewerRssTotalBytes: 15 * 1024 ** 3 }));
+  assert.equal(
+    verdict('memory_headroom', { samples: [...heavy, ...measuring], measuredFromMs: 4_000 }).status,
+    'breached',
+  );
 });
 
 test('memory is judged on tracked RSS, not on free memory', () => {
