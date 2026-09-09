@@ -2,9 +2,10 @@
  * Admission control.
  *
  * `CLAUDE.md` is emphatic that staggered starts are a correctness requirement,
- * not politeness: every viewer spends 0.12-0.18 vCPU on its first ~15 s
- * (dialing, TLS, kademlia), so eighty starting at once would want ~10 vCPU on
- * an 8-core box and every join-latency number from that run would be garbage.
+ * not politeness: every viewer spends real CPU on its first ~10 s verifying one
+ * `/tls/ws` certificate chain per peer it dials, so a cohort starting at once
+ * would want more vCPU than the box has and every join-latency number from that
+ * run would be garbage.
  *
  * A fixed inter-start delay implements that badly — too slow on an idle box,
  * too fast on a loaded one. So the gate is a CPU budget instead, seeded with
@@ -16,9 +17,21 @@
 import type { AdmissionConfig } from './transport/protocol.js';
 import { quantile } from './metrics/percentile.js';
 
-/** Priors from CLAUDE.md's CPU measurements on an M1. */
+/**
+ * Priors for what a viewer costs while joining.
+ *
+ * Measured, not inherited from the M1 figures: a paced viewer on an 8-core x86
+ * box holds 0.30 vCPU for ~5 s while it dials, sampled once a second from its
+ * own `/proc/<pid>/stat`. The old 0.18 came from an M1 and was wrong twice over
+ * — an x86 hyperthread costs more per unit of work, and the viewer's join was
+ * unpaced then, which cost 1.03 vCPU rather than 0.30.
+ *
+ * Still only a prior: `CostModel` replaces it as soon as this machine has said
+ * what a viewer costs here. It matters for the *first* cohort of a run, which
+ * is admitted before any sample exists.
+ */
 export const DEFAULT_ADMISSION: AdmissionConfig = {
-  bootstrapVcpu: 0.18,
+  bootstrapVcpu: 0.3,
   steadyVcpu: 0.03,
   targetUtilisation: 0.7,
   minStartIntervalMs: 250,

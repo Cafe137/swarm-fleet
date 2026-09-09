@@ -283,6 +283,13 @@ viewers was measuring a smaller fleet than it reports.
     `--assignment round-robin` to separate them.
 -   **`--peers` is the density lever, and lowering it lowers what is measured.** 200 is
     the real browser client's footprint and stays the default.
+-   **`--dial-rate` is how many connections a second each viewer may open.** The viewer
+    defaults to 50/s and that is usually right; drop it to 25 when a box is packed. It
+    matters because the join is the only expensive part of a viewer's life — each
+    connection costs ~2.6 ms verifying a `/tls/ws` certificate chain, on the one thread
+    the viewer has — and `--dial-rate 0` restores the unpaced burst, which pins a core per
+    joining viewer and *invalidated a 25-viewer run on 8 cores*: peak load 3.75 against
+    1.55, join p95 13.4 s against 6.4 s, 596 dial failures against 146.
 -   **The wire-to-media ratio is an upper bound on a shared machine.** Interface counters
     see everything on the NIC, so a box that also ran the publisher, the controller or
     someone's backup reports their traffic as the fleet's. Dedicated machines make it a

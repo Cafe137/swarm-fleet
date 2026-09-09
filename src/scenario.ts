@@ -66,6 +66,14 @@ export const Scenario = z
     network: z.enum(['mainnet', 'testnet']).default('mainnet'),
     live: z.boolean().default(true),
     peerLimit: z.number().int().positive().default(200),
+    /**
+     * Connections per second each viewer may open, or 0 for the unpaced burst.
+     *
+     * Left unset the viewer picks its own default. It is a fleet lever because
+     * the join is the only part of a viewer's life that costs a whole core, and
+     * on a box packed with viewers the peak is what breaches `cpu_headroom`.
+     */
+    dialRate: z.number().int().nonnegative().optional(),
     binary: z.string().default('../weeb-3-rs-hls/target/release/weeb-3-rs-hls'),
     agents: z.array(AgentTarget).default([{ host: 'local', weight: 1 }]),
     admission: z
@@ -177,6 +185,7 @@ export function resolveScenario(input: unknown): ResolvedScenario {
     network: scenario.network,
     live: scenario.live,
     peerLimit: scenario.peerLimit,
+    ...(scenario.dialRate === undefined ? {} : { dialRate: scenario.dialRate }),
     streams: scenario.streams,
     assignment: scenario.assignment,
     env: scenario.env,

@@ -90,6 +90,8 @@ export const ViewerSpec = z.object({
   network: z.enum(['mainnet', 'testnet']),
   live: z.boolean(),
   peerLimit: z.number().int().positive().optional(),
+  /** Connections per second a viewer may open. 0 is the unpaced burst. */
+  dialRate: z.number().int().nonnegative().optional(),
   durationS: z.number().positive().optional(),
   segments: z.number().int().positive().optional(),
   streams: z.array(StreamRef).min(1),

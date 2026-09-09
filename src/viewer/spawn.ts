@@ -69,6 +69,9 @@ export function viewerArgs(spec: ViewerSpec, stream: StreamRef): string[] {
   if (spec.peerLimit !== undefined) {
     args.push('--peers', String(spec.peerLimit));
   }
+  if (spec.dialRate !== undefined) {
+    args.push('--dial-rate', String(spec.dialRate));
+  }
   args.push(...spec.extraArgs);
   if (spec.network === 'testnet') {
     args.push('testnet');

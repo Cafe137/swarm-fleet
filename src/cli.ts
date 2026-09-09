@@ -58,6 +58,7 @@ run options:
   --network <net>        mainnet | testnet  (default mainnet)
   --vod                  read one playlist snapshot instead of following live
   --peers <n>            CONNECTION_BUILDUP_LIMIT per viewer  (default 200)
+  --dial-rate <n>        connections/s a viewer may open, 0 = unpaced burst
   --agent <host>         repeatable; "local" runs in-process (default local)
   --ramp-start / --ramp-step / --ramp-interval / --ramp-max
   --stop-degraded <f>    degraded-viewer share that ends a ramp  (default 0.10)
@@ -269,6 +270,7 @@ async function scenarioFromArgs(args: Args): Promise<unknown> {
     assignment: args.value('assignment') as Scenario['assignment'] | undefined,
     binary: args.value('binary'),
     peerLimit: args.number('peers'),
+    dialRate: args.number('dial-rate'),
     sampleIntervalMs: args.number('sample-interval'),
     graceMs: args.number('grace'),
     maxRunS: args.number('max-run'),

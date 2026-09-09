@@ -22,19 +22,19 @@ test('the minimum interval holds off a second start', () => {
 
 test('the cpu budget refuses a flood on eight cores', () => {
   const gate = new AdmissionGate(8, noJitter, new CostModel(), () => 0);
-  // 8 cores * 0.7 = 5.6 vCPU. At 0.18 per bootstrap that is 31 concurrent.
-  assert.equal(gate.decide(10_000, { bootstrapping: 30, running: 0 }).admit, true);
-  const refused = gate.decide(10_000, { bootstrapping: 31, running: 0 });
+  // 8 cores * 0.7 = 5.6 vCPU. At 0.30 per bootstrap that is 18 concurrent.
+  assert.equal(gate.decide(10_000, { bootstrapping: 17, running: 0 }).admit, true);
+  const refused = gate.decide(10_000, { bootstrapping: 18, running: 0 });
   assert.equal(refused.admit, false);
   assert.match(refused.reason, /cpu budget/);
 });
 
 test('steady viewers count against the budget too', () => {
   const gate = new AdmissionGate(8, noJitter, new CostModel(), () => 0);
-  // The budget is 8 * 0.7 = 5.6 vCPU. 180 steady viewers at 0.03 is 5.40, which
-  // still leaves room for one 0.18 bootstrap; 181 is 5.43, which does not.
-  assert.equal(gate.decide(10_000, { bootstrapping: 0, running: 180 }).admit, true);
-  assert.equal(gate.decide(10_000, { bootstrapping: 0, running: 181 }).admit, false);
+  // The budget is 8 * 0.7 = 5.6 vCPU. 176 steady viewers at 0.03 is 5.28, which
+  // still leaves room for one 0.30 bootstrap; 177 is 5.31, which does not.
+  assert.equal(gate.decide(10_000, { bootstrapping: 0, running: 176 }).admit, true);
+  assert.equal(gate.decide(10_000, { bootstrapping: 0, running: 177 }).admit, false);
 });
 
 test('flood mode disables both bounds', () => {
@@ -47,7 +47,7 @@ test('measured cost replaces the prior once there is enough of it', () => {
   const costs = new CostModel();
   const gate = new AdmissionGate(8, noJitter, costs, () => 0);
   assert.equal(gate.budget().source, 'prior');
-  assert.equal(gate.budget().bootstrapVcpu, 0.18);
+  assert.equal(gate.budget().bootstrapVcpu, 0.3);
 
   // An x86 hyperthread costing twice an M1 core-second should halve the fleet.
   for (let at = 0; at < 6; at += 1) {
