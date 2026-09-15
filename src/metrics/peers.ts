@@ -11,10 +11,9 @@
  * to make room for a new one.
  *
  * The generator therefore produced roughly half the connection load the run
- * asked for, and every guard passed: load was 3.27 of 122 cores, memory 196 GB
- * free, and `dial_failures` could not see it because a viewer stuck at zero
- * peers never stops bootstrapping, so its settle gate never opened. The stalls
- * that followed would have been published as Swarm's.
+ * asked for, and every guard passed: load was 3.27 of 122 cores and memory
+ * 196 GB free. The stalls that followed would have been published as Swarm's.
+ * Nothing else could see it, which is why this is measured directly.
  *
  * Two shapes matter and they point at different causes, so they are counted
  * apart rather than summed:

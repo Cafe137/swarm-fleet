@@ -19,6 +19,11 @@
  *     as the *lines* it printed only if none of them wrapped. One over-wide
  *     machine row made the whole frame march down the screen, leaving a copy of
  *     its top line behind every second.
+ * -   **The block is cut to the terminal's height as well.** `cursorUp` cannot
+ *     rewind past the top of the screen, so a block taller than the window
+ *     leaves whatever scrolled off it un-erased — the same runaway as a wrapped
+ *     line, but caused by one machine too many rather than one column too many.
+ *     The machine table gives up rows for it, worst box first.
  * -   **The table is laid out to fit.** Columns have declared widths and the
  *     least informative ones are dropped on a narrow terminal, because a
  *     20-character hostname silently eating its neighbour's column is worse
@@ -41,6 +46,10 @@ const SHOW_CURSOR = `${ESC}[?25h`;
 const INDENT = '  ';
 /** Narrower than this and the block would have to give up a column it needs. */
 const MIN_WIDTH = 40;
+/** Shorter than this and the block is cut off rather than laid out. */
+const MIN_HEIGHT = 6;
+/** A machine table's own lines: top border, header, its rule, bottom border. */
+const MACHINE_TABLE_CHROME = 4;
 
 export interface ConsoleViewOptions {
   /** Where the block is drawn. stderr, so stdout stays machine output. */
@@ -57,6 +66,7 @@ export class ConsoleView {
   private readonly durationS: number | undefined;
   private rowsDrawn = 0;
   private widthDrawnAt = 0;
+  private heightDrawnAt = 0;
   private cursorHidden = false;
   private lastPlainAtMs = 0;
 
@@ -79,10 +89,11 @@ export class ConsoleView {
     }
 
     const width = this.width();
+    const height = this.height();
     // A resize reflows what is already on screen, so the row count we are
     // holding stops describing it. Start a fresh block rather than erase the
     // wrong rows.
-    if (width !== this.widthDrawnAt) {
+    if (width !== this.widthDrawnAt || height !== this.heightDrawnAt) {
       this.rowsDrawn = 0;
     }
     if (!this.cursorHidden) {
@@ -93,11 +104,12 @@ export class ConsoleView {
       process.once('exit', () => this.release());
     }
 
-    const lines = this.block(snapshot, width).map((line) => clip(line, width));
+    const lines = this.block(snapshot, width, height).map((line) => clip(line, width));
     this.erase();
     this.out.write(`${lines.join('\n')}\n`);
     this.rowsDrawn = lines.length;
     this.widthDrawnAt = width;
+    this.heightDrawnAt = height;
   }
 
   /**
@@ -142,15 +154,33 @@ export class ConsoleView {
     return Math.max(MIN_WIDTH, (columns === undefined || columns <= 0 ? 100 : columns) - 1);
   }
 
-  private block(snapshot: LiveSnapshot, width: number): string[] {
-    return [
+  /**
+   * How many rows the block may occupy.
+   *
+   * One short of the window, for the row the cursor parks on: the frame writes
+   * a newline after its last line, so a block of exactly the window's height
+   * scrolls the screen by one and `erase()` can no longer reach its top.
+   */
+  private height(): number {
+    const rows = this.out.rows;
+    return Math.max(MIN_HEIGHT, (rows === undefined || rows <= 0 ? 24 : rows) - 1);
+  }
+
+  private block(snapshot: LiveSnapshot, width: number, height: number): string[] {
+    const inner = width - INDENT.length;
+    const head = [
       '',
-      INDENT + this.headline(snapshot, width - INDENT.length),
+      INDENT + this.headline(snapshot, inner),
       '',
-      ...indent(fleetTable(snapshot, width - INDENT.length)),
-      '',
-      ...indent(machineTable(snapshot.agents, width - INDENT.length)),
+      ...indent(fleetTable(snapshot, inner)),
     ];
+    // Whatever is left over after the headline, the fleet table and the blank
+    // line that would separate them from the machines.
+    const machines = machineTable(snapshot.agents, inner, height - head.length - 1);
+    const lines = machines.length === 0 ? head : [...head, '', ...indent(machines)];
+    // A window too short even for the fleet table: cut it, rather than print
+    // rows that cannot be erased.
+    return lines.slice(0, height);
   }
 
   /**
@@ -423,14 +453,65 @@ const MACHINE_COLUMNS: Column<MachineColumn>[] = [
   { key: 'note', head: 'note', width: 24, flex: { min: 12, floor: 6, max: 40 } },
 ];
 
-export function machineTable(agents: readonly AgentSnapshot[], width: number): string[] {
-  const rows = agents.map((agent) => machineCells(agent));
-  return renderTable(MACHINE_COLUMNS, rows, width, (key, text, index) => {
-    if (key !== 'note' || text === '') {
-      return text;
-    }
-    return agents[index]?.breachedGuard !== undefined ? pc.red(text) : pc.dim(text);
-  });
+export function machineTable(
+  agents: readonly AgentSnapshot[],
+  width: number,
+  maxLines = Number.POSITIVE_INFINITY,
+): string[] {
+  const shown =
+    agents.length + MACHINE_TABLE_CHROME <= maxLines
+      ? agents
+      : // One more line goes to saying what was left out.
+        mostTroubled(agents, maxLines - MACHINE_TABLE_CHROME - 1);
+  if (shown.length === 0 && agents.length > 0) {
+    return [];
+  }
+  const lines = renderTable(
+    MACHINE_COLUMNS,
+    shown.map((agent) => machineCells(agent)),
+    width,
+    (key, text, index) => {
+      if (key !== 'note' || text === '') {
+        return text;
+      }
+      return shown[index]?.breachedGuard !== undefined ? pc.red(text) : pc.dim(text);
+    },
+  );
+  const hidden = agents.length - shown.length;
+  if (hidden === 0) {
+    return lines;
+  }
+  // The hidden machines are the quiet ones by construction, so name the ceiling
+  // they sit under rather than just how many there are.
+  const ceiling = worstCpu(agents.filter((agent) => !shown.includes(agent)));
+  const note = `… ${hidden} more ${hidden === 1 ? 'machine' : 'machines'}${
+    ceiling === undefined ? '' : `, none above ${percent(ceiling)} cpu`
+  }`;
+  return [...lines, pc.dim(clip(note, width))];
+}
+
+/**
+ * Which machines keep their row when they do not all fit.
+ *
+ * Cutting the table off at the end would hide exactly the box a run is about to
+ * fail on, so rows are earned by trouble — a breached guard beats any amount of
+ * load — and the survivors are then put back into the fleet's own order,
+ * because a table whose rows reshuffle every second cannot be read.
+ */
+function mostTroubled(agents: readonly AgentSnapshot[], keep: number): AgentSnapshot[] {
+  if (keep <= 0) {
+    return [];
+  }
+  return agents
+    .map((agent, index) => ({ agent, index }))
+    .sort((a, b) => trouble(b.agent) - trouble(a.agent))
+    .slice(0, keep)
+    .sort((a, b) => a.index - b.index)
+    .map((entry) => entry.agent);
+}
+
+function trouble(agent: AgentSnapshot): number {
+  return (agent.breachedGuard === undefined ? 0 : 1) + (agent.cpuUtilisation ?? 0);
 }
 
 // ------------------------------------------------------------ non-terminal

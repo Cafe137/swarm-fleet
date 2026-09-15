@@ -109,7 +109,6 @@ export interface ViewerRecord {
   held?: boolean | undefined;
   releasedAtMs?: number | undefined;
   heldMs?: number | undefined;
-  dialFailures: number;
   feedIndexLast?: number | undefined;
   finalized: boolean;
 
@@ -169,7 +168,6 @@ export class ViewerRollup {
       gapsLocal: 0,
       reconstructProbes: 0,
       reconstructRuns: 0,
-      dialFailures: 0,
       finalized: false,
       events: 0,
       unknownEvents: 0,
@@ -216,10 +214,6 @@ export class ViewerRollup {
         const peers = event.peers as number;
         this.record.peersLast = peers;
         this.record.peersMax = Math.max(this.record.peersMax ?? 0, peers);
-        this.record.dialFailures = Math.max(
-          this.record.dialFailures,
-          (event.dial_failures as number) ?? 0,
-        );
         break;
       }
       case 'held': {

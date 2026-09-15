@@ -1,7 +1,7 @@
 {"ev":"start","mode":"vod","network_id":1,"owner":"6F2728386F8a47ef5EBe323721188e630Ff0FdE9","peer_limit":200,"pid":3734,"t":1,"topic":"f3ee0319-469e-4c2c-bb83-edcb06deda33","version":"0.0.0"}
-{"dial_failures":0,"ev":"peers","peers":25,"t":772}
+{"ev":"peers","peers":25,"t":772}
 {"ev":"joined","feed_index":3888,"join_ms":7542,"runway_s":7774.4666599999955,"start_sequence":0,"t":8314,"window":3888}
-{"dial_failures":7,"ev":"peers","peers":198,"t":8679}
+{"ev":"peers","peers":198,"t":8679}
 {"attempts":1,"buffered_s":2.0,"bytes":632620,"ev":"segment","fetch_ms":365.23991700000005,"peers":198,"segment_s":2.0,"sequence":0,"stall_s":0.0,"stalled":false,"t":8679}
 {"attempts":1,"buffered_s":3.66650575,"bytes":664204,"ev":"segment","fetch_ms":333.49424999999997,"peers":199,"segment_s":2.0,"sequence":1,"stall_s":0.0,"stalled":false,"t":9013}
 {"attempts":1,"buffered_s":5.329314666,"bytes":664580,"ev":"segment","fetch_ms":337.191084,"peers":200,"segment_s":2.0,"sequence":2,"stall_s":0.0,"stalled":false,"t":9350}

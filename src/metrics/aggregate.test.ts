@@ -31,7 +31,6 @@ function record(overrides: Partial<ViewerRecord> = {}): ViewerRecord {
     gapsLocal: 0,
     reconstructProbes: 0,
     reconstructRuns: 0,
-    dialFailures: 0,
     finalized: true,
     events: 60,
     unknownEvents: 0,

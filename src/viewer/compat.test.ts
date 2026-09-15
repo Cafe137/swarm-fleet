@@ -72,9 +72,6 @@ test('a real VOD watch parses into the KPIs the report needs', async () => {
   // faster than playback, which is what CLAUDE.md measured.
   assert.ok((record.realtimeFactor.p50 ?? 1) < 0.2);
   assert.ok((record.fetchMs.p50 ?? 0) > 300 && (record.fetchMs.p50 ?? 0) < 400);
-
-  // Dial failures ride on `peers` events, and the fixture has some.
-  assert.equal(record.dialFailures, 7);
 });
 
 test('a peer-only run parses, and reports no playback', async () => {

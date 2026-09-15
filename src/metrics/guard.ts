@@ -89,9 +89,6 @@ export interface GuardInput {
   clockOffsetMs?: number | undefined;
   /** Smallest control-channel round trip: the offset cannot be known better. */
   clockRttMs?: number | undefined;
-  dialFailureSeries: readonly number[];
-  /** Viewers bootstrapping at each sample, parallel to `dialFailureSeries`. */
-  bootstrappingSeries?: readonly number[] | undefined;
   /** Per-viewer peer footprint on this agent, for `peer_target`. */
   peerAttainment?: readonly PeerAttainment[] | undefined;
   /**
@@ -129,7 +126,6 @@ export function evaluateGuards(input: GuardInput): GuardVerdict[] {
   return [
     cpuHeadroom(input),
     memoryHeadroom(input),
-    dialFailures(input),
     peerTarget(input),
     staggerAdherence(input),
     samplerJitter(input),
@@ -199,70 +195,13 @@ function memoryHeadroom({ machine, samples }: GuardInput): GuardVerdict {
 }
 
 /**
- * Are dial failures *accumulating* once the fleet has settled?
- *
- * Growth over consecutive ticks rather than a raw count, because a handful of
- * unreachable peers is ordinary and a rising series is the ephemeral-port
- * ceiling. But ticks with viewers still bootstrapping are skipped, and that is
- * not a nicety: a staggered cohort adds a fresh viewer dialing 200 peers every
- * few hundred milliseconds, so failures rise monotonically for the whole ramp
- * and the guard fired on a 4-viewer run holding 805 sockets against 28,000
- * available ports. Growth while viewers are still joining says nothing about a
- * ceiling; growth after they have all joined is the signal.
- */
-function dialFailures({ dialFailureSeries, bootstrappingSeries }: GuardInput): GuardVerdict {
-  if (dialFailureSeries.length === 0) {
-    return { name: 'dial_failures', status: 'no_data', detail: 'viewer does not report dial failures' };
-  }
-  const total = dialFailureSeries[dialFailureSeries.length - 1] as number;
-  const settled = (at: number): boolean =>
-    bootstrappingSeries === undefined ||
-    ((bootstrappingSeries[at] ?? 0) === 0 && (bootstrappingSeries[at - 1] ?? 0) === 0);
-
-  let run = 0;
-  let firstBreach: number | undefined;
-  let compared = 0;
-  for (let at = 1; at < dialFailureSeries.length; at += 1) {
-    if (!settled(at)) {
-      run = 0;
-      continue;
-    }
-    compared += 1;
-    const grew = (dialFailureSeries[at] as number) > (dialFailureSeries[at - 1] as number);
-    run = grew ? run + 1 : 0;
-    if (run >= GUARD_SUSTAIN_SAMPLES && firstBreach === undefined) {
-      firstBreach = at;
-    }
-  }
-  if (compared === 0) {
-    return {
-      name: 'dial_failures',
-      status: 'no_data',
-      detail: `${total} dial failures, all while viewers were still joining`,
-      value: total,
-    };
-  }
-  return {
-    name: 'dial_failures',
-    status: firstBreach === undefined ? 'ok' : 'breached',
-    detail:
-      firstBreach === undefined
-        ? `${total} dial failures, not rising once joined`
-        : `dial failures rose for ${GUARD_SUSTAIN_SAMPLES} consecutive ticks after the fleet settled (${total} total) — suspect ephemeral ports, not Swarm`,
-    value: total,
-    threshold: 0,
-  };
-}
-
-/**
  * Did the viewers on this box hold the peer footprint the run asked for?
  *
- * The companion to `dial_failures`, and the one that actually fires. Dial
- * failures are gated on the fleet having settled, and a viewer that cannot get
- * peers never settles — so the box where 48 viewers sat at zero peers produced
- * `no_data` there while CPU and memory sailed through on 3.27 of 122 cores and
- * 196 GB free. This asks the question from the other end: never mind how many
- * dials failed, how many peers are actually *held*.
+ * The only guard on the fleet's peering, and the one that matters: a viewer
+ * that does not hold its footprint is not generating the load the run claims,
+ * whatever else looks healthy. Ask it of the peers themselves — a box where 48
+ * viewers sat at zero peers had CPU and memory to spare and nothing else to
+ * report it.
  *
  * Judged on final counts rather than peaks on purpose. A NAT table that evicts
  * its oldest entry lets every viewer reach its target and then takes the

@@ -176,9 +176,6 @@ interface AgentLink {
   started: number;
   exited: number;
   admissionReason?: string | undefined;
-  dialFailureSeries: number[];
-  /** Viewers still bootstrapping at each sample, parallel to the series above. */
-  bootstrappingSeries: number[];
   lastSample?: MachineSample | undefined;
   ready: boolean;
   helloSeen: boolean;
@@ -326,8 +323,6 @@ export class Controller {
         held: 0,
         started: 0,
         exited: 0,
-        dialFailureSeries: [],
-        bootstrappingSeries: [],
         ready: false,
         helloSeen: false,
         collectDone: false,
@@ -1079,8 +1074,6 @@ export class Controller {
         for (const sample of message.viewers) {
           this.rollups.get(sample.viewerId)?.noteResource(sample.rssBytes, sample.cpuSeconds);
         }
-        link.dialFailureSeries.push(this.dialFailuresFor(link.report.name));
-        link.bootstrappingSeries.push(link.bootstrapping);
         break;
       }
       case 'log':
@@ -1175,16 +1168,6 @@ export class Controller {
       }));
   }
 
-  private dialFailuresFor(agent: string): number {
-    let total = 0;
-    for (const record of this.records()) {
-      if (record.agent === agent) {
-        total += record.dialFailures;
-      }
-    }
-    return total;
-  }
-
   private evaluateAllGuards(): GuardVerdict[] {
     const verdicts: GuardVerdict[] = [];
     for (const link of this.links) {
@@ -1200,8 +1183,6 @@ export class Controller {
         admissionDisabled: this.scenario.admission.disabled,
         clockOffsetMs: link.report.clockOffsetMs,
         clockRttMs: link.report.clockRttMs,
-        dialFailureSeries: link.dialFailureSeries,
-        bootstrappingSeries: link.bootstrappingSeries,
         peerAttainment: this.peerAttainmentFor(link.report.name),
         // `port-ceiling` and `flood` exist to find the point where viewers stop
         // getting peers, so there the shortfall is the answer, not a fault.

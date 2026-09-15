@@ -34,8 +34,6 @@ function sample(overrides: Partial<MachineSample> = {}): MachineSample {
 function guards(overrides: {
   samples?: MachineSample[];
   startTimestamps?: number[];
-  dialFailureSeries?: number[];
-  bootstrappingSeries?: number[];
   clockOffsetMs?: number;
   clockRttMs?: number;
   admissionDisabled?: boolean;
@@ -50,10 +48,6 @@ function guards(overrides: {
     minStartIntervalMs: 250,
     admissionDisabled: overrides.admissionDisabled ?? false,
     clockOffsetMs: overrides.clockOffsetMs ?? 2,
-    dialFailureSeries: overrides.dialFailureSeries ?? [0, 0, 0, 0],
-    ...(overrides.bootstrappingSeries === undefined
-      ? {}
-      : { bootstrappingSeries: overrides.bootstrappingSeries }),
     ...(overrides.clockRttMs === undefined ? {} : { clockRttMs: overrides.clockRttMs }),
     ...(overrides.measuredFromMs === undefined
       ? {}
@@ -135,11 +129,6 @@ test('memory is judged on tracked RSS, not on free memory', () => {
   assert.equal(verdict('memory_headroom', { samples: idleMac }).status, 'ok');
 });
 
-test('dial failures breach when they rise, not when they merely exist', () => {
-  assert.equal(verdict('dial_failures', { dialFailureSeries: [3, 3, 3, 3, 3] }).status, 'ok');
-  assert.equal(verdict('dial_failures', { dialFailureSeries: [0, 1, 4, 9, 20] }).status, 'breached');
-});
-
 test('starts crowded closer than the floor breach the stagger guard', () => {
   assert.equal(verdict('stagger_adherence', { startTimestamps: [0, 300, 600] }).status, 'ok');
   assert.equal(
@@ -185,38 +174,6 @@ test('agent overhead is recorded but never a reason to fail', () => {
 test('no samples is no data, which is not the same as ok', () => {
   const empty = guards({ samples: [] });
   assert.equal(empty.find((entry) => entry.name === 'cpu_headroom')?.status, 'no_data');
-});
-
-test('dial failures rising while viewers are still joining prove nothing', () => {
-  // A staggered cohort adds a viewer dialing 200 peers every few hundred
-  // milliseconds, so failures rise for the whole ramp. This fired on a real
-  // 4-viewer run holding 805 sockets against 28,000 available ports.
-  const rising = [0, 4, 20, 60, 92];
-  assert.equal(
-    verdict('dial_failures', {
-      dialFailureSeries: rising,
-      bootstrappingSeries: [1, 2, 2, 1, 1],
-    }).status,
-    'no_data',
-  );
-
-  // The same growth after everything has joined is the signal it exists for.
-  assert.equal(
-    verdict('dial_failures', {
-      dialFailureSeries: rising,
-      bootstrappingSeries: [0, 0, 0, 0, 0],
-    }).status,
-    'breached',
-  );
-
-  // Mixed: the ramp is skipped, and the settled tail is judged on its own.
-  assert.equal(
-    verdict('dial_failures', {
-      dialFailureSeries: [0, 30, 60, 61, 61, 61],
-      bootstrappingSeries: [2, 2, 1, 0, 0, 0],
-    }).status,
-    'ok',
-  );
 });
 
 test('a remote clock is not judged more precisely than the link allows', () => {
@@ -306,20 +263,16 @@ test('a mode hunting for the connection ceiling records the shortfall without vo
 
 /**
  * The run that motivated this guard: 128 viewers on a 122-core box behind a
- * NAT, 48 of them at zero peers. Every existing guard passed — CPU and memory
- * had enormous headroom, and `dial_failures` could not speak because a viewer
- * that cannot get peers never settles, so its gate never opened.
+ * NAT, 48 of them at zero peers. Every other guard passed — CPU and memory had
+ * enormous headroom — so the fleet reported a healthy run while generating half
+ * the connection load it was asked for.
  */
 test('the NAT-starved fleet that passed every other guard is caught by this one', () => {
   const all = guards({
     // 122 cores, load 3.27: nowhere near the CPU guard.
     samples: [sample({ loadAvg1: 3.27 }), sample({ loadAvg1: 3.27 }), sample({ loadAvg1: 3.3 })],
-    // Dial failures climbed the whole run, but nothing ever settled.
-    dialFailureSeries: [0, 20_000, 60_000, 93_937],
-    bootstrappingSeries: [48, 48, 48, 48],
     peerAttainment: [...peered(80, 200), ...peered(48, 0, 0)],
   });
-  assert.equal(pick('dial_failures', all).status, 'no_data');
   assert.equal(pick('cpu_headroom', all).status, 'ok');
   assert.equal(pick('peer_target', all).status, 'breached');
   assert.equal(guardsValid(all), false);

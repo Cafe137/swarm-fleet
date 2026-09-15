@@ -29,15 +29,16 @@ test('an unknown ev is kept and flagged, never fatal', () => {
 });
 
 test('unknown fields on a known event pass through', () => {
+  // A field a newer viewer adds must not reject the event on an older fleet.
   const result = parseViewerEvent(
-    '{"t":1,"ev":"peers","peers":42,"dial_failures":3,"future_field":true}',
+    '{"t":1,"ev":"peers","peers":42,"future_field":true}',
   );
   assert.equal(result.ok, true);
   if (!result.ok) {
     return;
   }
   assert.equal(result.event['future_field'], true);
-  assert.equal(result.event['dial_failures'], 3);
+  assert.equal(result.event['peers'], 42);
 });
 
 test('garbage is a datum about the viewer, not an exception', () => {

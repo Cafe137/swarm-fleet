@@ -38,7 +38,6 @@ export const PeersEvent = z
     ...stamped,
     ev: z.literal('peers'),
     peers: z.number().int().nonnegative(),
-    dial_failures: z.number().int().nonnegative().default(0),
   })
   .passthrough();
 

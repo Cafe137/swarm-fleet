@@ -57,7 +57,6 @@ export interface CohortKpis {
   gapsLocal: number;
   gapsPublisher: number;
   reconstructProbes: number;
-  dialFailures: number;
   peersTotal: number;
   peakRssTotalBytes: number;
   cpuSecondsTotal: number;
@@ -172,7 +171,6 @@ export function cohortKpis(
     gapsLocal: sum(records.map((record) => record.gapsLocal)),
     gapsPublisher: sum(records.map((record) => record.gapsPublisher)),
     reconstructProbes: sum(records.map((record) => record.reconstructProbes)),
-    dialFailures: sum(records.map((record) => record.dialFailures)),
     peersTotal: sum(records.map((record) => record.peersLast ?? 0)),
     peakRssTotalBytes: sum(records.map((record) => record.peakRssBytes ?? 0)),
     cpuSecondsTotal: sum(records.map((record) => record.cpuSeconds ?? 0)),

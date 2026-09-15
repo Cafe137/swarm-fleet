@@ -47,10 +47,11 @@ function live(agents: AgentSnapshot[]): LiveSnapshot {
 }
 
 /** A terminal that records what was written to it. */
-function fakeTty(columns: number): NodeJS.WriteStream & { written: string[] } {
+function fakeTty(columns: number, rows = 40): NodeJS.WriteStream & { written: string[] } {
   const written: string[] = [];
   return {
     columns,
+    rows,
     isTTY: true,
     write(text: string): boolean {
       written.push(text);
@@ -207,6 +208,53 @@ test('the block moves the cursor up by exactly the rows it printed', () => {
     redraw.startsWith(`\u001b[${rows}A\u001b[0J`),
     `expected the frame to rewind ${rows} rows, got ${JSON.stringify(redraw.slice(0, 12))}`,
   );
+});
+
+test('the block is cut to the terminal height, not just its width', () => {
+  // `cursorUp` stops at the top of the screen, so a block taller than the
+  // window leaves whatever scrolled off it behind on every frame — which is
+  // what a run of a dozen machines did: five lines of the previous frame
+  // stranded above each new one, a second apart, for the whole run.
+  const agents = Array.from({ length: 12 }, (_, index) =>
+    snapshot({ name: `box-${index}`, cpuUtilisation: index / 100 }),
+  );
+  for (const rows of [10, 16, 20, 24, 50]) {
+    const out = fakeTty(100, rows);
+    const view = new ConsoleView({ out, interactive: true, durationS: 300 });
+    view.render(live(agents));
+    const printed = out.written.join('').split('\n').length - 1;
+    assert.ok(
+      printed <= rows - 1,
+      `a ${rows}-row terminal was given ${printed} lines, so ${printed - rows + 1} would strand`,
+    );
+
+    out.written.length = 0;
+    view.render(live(agents));
+    assert.ok(
+      out.written.join('').startsWith(`\u001b[${printed}A\u001b[0J`),
+      `expected the frame to rewind ${printed} rows on a ${rows}-row terminal`,
+    );
+  }
+});
+
+test('a short terminal gives up the quiet machines, not the breached one', () => {
+  // The rows that are cut are the ones with nothing to say. Cutting the table
+  // off at its end would hide exactly the box the run is about to fail on.
+  const agents = [
+    snapshot({ name: 'box-a', cpuUtilisation: 0.02 }),
+    snapshot({ name: 'box-b', cpuUtilisation: 0.03 }),
+    snapshot({ name: 'box-c', cpuUtilisation: 0.04 }),
+    snapshot({ name: 'box-d', cpuUtilisation: 0.01, breachedGuard: 'cpu_headroom' }),
+    snapshot({ name: 'box-e', cpuUtilisation: 0.91 }),
+  ];
+  const lines = machineTable(agents, 120, 7).join('\n');
+  assert.match(lines, /box-d/);
+  assert.match(lines, /box-e/);
+  assert.doesNotMatch(lines, /box-a/);
+  // And it says what it left out, with the ceiling those machines sit under.
+  assert.match(lines, /… 3 more machines, none above 4\.0% cpu/);
+  // Kept rows stay in the fleet's order: box-d is listed before box-e.
+  assert.ok(lines.indexOf('box-d') < lines.indexOf('box-e'));
 });
 
 test('a log is written where the block is, so the next frame redraws below it', () => {

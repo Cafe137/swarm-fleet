@@ -209,13 +209,12 @@ export async function runMockViewer(
   // raises it — before asking the network for anything, and keeps dialing
   // toward its limit while it watches.
   let peers = 0;
-  let dialFailures = 0;
   const peerTarget = Math.min(args.peerUp ?? 25, peerLimit);
   const peerStep = Math.max(config.peersRampMs / 10, 1);
   while (peers < peerTarget && !terminating) {
     await sleepSim(peerStep);
     peers = Math.min(peerLimit, Math.round((simMs() / config.peersRampMs) * peerLimit));
-    emit({ ev: 'peers', peers, dial_failures: dialFailures });
+    emit({ ev: 'peers', peers });
   }
   if (terminating) {
     emitSummary();
@@ -240,7 +239,7 @@ export async function runMockViewer(
       while (!settled && !terminating) {
         await Promise.race([release, sleepSim(1_000)]);
         peers = Math.min(peerLimit, Math.round((simMs() / config.peersRampMs) * peerLimit));
-        emit({ ev: 'peers', peers, dial_failures: dialFailures });
+        emit({ ev: 'peers', peers });
       }
     }
     emit({ ev: 'released', peers, held_ms: Math.round(simMs() - heldAt), reason });
@@ -300,13 +299,13 @@ export async function runMockViewer(
       const held = Math.round(peerLimit * config.peersEvictTo);
       if (peers !== held) {
         peers = held;
-        emit({ ev: 'peers', peers, dial_failures: dialFailures });
+        emit({ ev: 'peers', peers });
       }
     } else if (peers < peerLimit) {
       const arrived = Math.min(peerLimit, Math.round((simMs() / config.peersRampMs) * peerLimit));
       if (arrived > peers) {
         peers = arrived;
-        emit({ ev: 'peers', peers, dial_failures: dialFailures });
+        emit({ ev: 'peers', peers });
       }
     }
 
