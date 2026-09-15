@@ -18,7 +18,11 @@ import { mkdtemp, readFile, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { Controller, type RunResult } from './controller.js';
+import { type AgentTransport, Controller, type RunResult } from './controller.js';
+import { FleetAgent } from './agent/agent.js';
+import type { Channel } from './transport/channel.js';
+import { localChannelPair } from './transport/local.js';
+import type { FromAgent, ToAgent } from './transport/protocol.js';
 import { renderReport } from './report/markdown.js';
 import { buildSummary } from './report/summary.js';
 import { createRunDir, runId } from './run-dir.js';
@@ -427,4 +431,105 @@ test('abort interrupts the run loop instead of waiting it out', async () => {
   // And it still reported: an aborted run is a short run, not a lost one.
   const files = await readdir(path.join(dir, 'viewers'));
   assert.ok(files.some((file) => file.endsWith('.ndjson')), `no viewer records in ${files.join()}`);
+});
+
+/**
+ * A machine can leave in the middle of a run, and the rest must carry on.
+ *
+ * Measured the hard way: a 20-machine, 1000-viewer settled cohort lost two
+ * boxes during the join, and the other 900 viewers sat parked at the barrier —
+ * peered, idle, watching nothing — because the barrier was still waiting for
+ * 100 viewers on machines that no longer existed. The run had to be killed
+ * before it measured anything at all.
+ *
+ * The transport is injected so the test can hold one end of a control channel
+ * and cut it, which is the only way to lose a machine without an ssh server and
+ * a network to break. `settle.timeoutS` is far longer than the test: if the
+ * barrier waited out the deadline instead of shrinking to the fleet that was
+ * left, this would fail by timing out rather than by assertion.
+ */
+test('a machine lost mid-settle does not strand the cohort behind the barrier', async () => {
+  const scenario = resolveScenario({
+    mode: 'cohort',
+    binary: 'mock',
+    streams: [{ owner: 'aabb', topic: 'ccdd' }],
+    segments: 6,
+    viewers: 4,
+    peerLimit: 40,
+    agents: [
+      { host: 'local', name: 'steady', weight: 1 },
+      { host: 'local', name: 'doomed', weight: 1 },
+    ],
+    settle: { timeoutS: 120 },
+    admission: { minStartIntervalMs: 10, startJitterMs: 0 },
+    sampleIntervalMs: 250,
+    graceMs: 3_000,
+    maxRunS: 60,
+    // Slower to peer than the other tests, so the settle phase is long enough
+    // to lose a machine inside it — which is when this happened for real.
+    env: { ...FAST_ENV, MOCK_PEERS_RAMP_MS: '4000' },
+  });
+
+  let lostAlready = false;
+  const transport: AgentTransport = (target) => {
+    const pair = localChannelPair();
+    void new FleetAgent(pair.agentSide).start();
+    if ((target.name ?? target.host) !== 'doomed') {
+      return { channel: pair.controllerSide };
+    }
+    // Cut the moment this machine reports a viewer parked at the barrier: a
+    // machine the cohort is counting on, with live viewers on it, vanishing
+    // mid-settle. Driven off its own messages rather than a timer, so the
+    // instant is the same on every machine this test runs on.
+    const channel: Channel<ToAgent, FromAgent> = {
+      ...pair.controllerSide,
+      onMessage: (handler) =>
+        pair.controllerSide.onMessage((message) => {
+          handler(message);
+          if (!lostAlready && message.kind === 'state' && message.held >= 1) {
+            lostAlready = true;
+            setImmediate(() => pair.controllerSide.close());
+          }
+        }),
+    };
+    return { channel };
+  };
+
+  const runsDir = await mkdtemp(path.join(os.tmpdir(), 'swarm-fleet-test-'));
+  const id = runId(scenario.label);
+  const dir = await createRunDir(runsDir, id);
+  let released = false;
+  const controller = new Controller(
+    scenario,
+    id,
+    dir,
+    {
+      onSettled: async () => {
+        released = true;
+      },
+    },
+    transport,
+  );
+  const result = await controller.run(false);
+
+  assert.equal(lostAlready, true, 'the doomed agent was cut');
+  assert.equal(released, true, 'the cohort was released rather than left at the barrier');
+  // The barrier opened on the fleet that was left rather than waiting out the
+  // 120 s deadline for viewers that no longer existed. This is the assertion
+  // the whole test is for.
+  assert.ok(result.settleS < 30, `settled in ${result.settleS.toFixed(1)}s`);
+
+  // The survivors watched their whole run: this is the recovery.
+  assert.equal(result.kpis.viewers.byOutcome.completed, 2);
+  assert.equal(result.kpis.segments, 12);
+  // The lost machine's viewers are their own outcome, not `running` for ever
+  // and not counted among the viewers this fleet was generating load with.
+  assert.equal(result.kpis.viewers.byOutcome.agent_lost, 2);
+  assert.equal(result.kpis.viewers.watching, 0);
+
+  // And the run says what happened: a fleet that shrank measured less load
+  // than it was asked for, whatever the survivors managed.
+  assert.equal(result.valid, false);
+  assert.match(result.invalidBecause.join(' '), /agent doomed disconnected/);
+  assert.match(result.caveats.join(' '), /machines left the fleet mid-run/);
 });

@@ -17,7 +17,13 @@ import { FeedPublisher } from './feed.js';
 import { ManifestManager } from './manifest.js';
 import { Registry } from './registry.js';
 import { hlsSegments, type SourceOptions } from './source.js';
-import { DEFAULT_GATEWAY, makeBee, uploadSegment } from './swarm.js';
+import {
+  DEFAULT_GATEWAY,
+  DEFAULT_MIRRORS,
+  type MirrorReport,
+  SwarmWriter,
+  uploadSegment,
+} from './swarm.js';
 
 /**
  * Phrase behind the default dev key, so `owner` is stable across runs, and the
@@ -37,6 +43,11 @@ const REGISTRY_TOPIC = 'everstream-streams';
 
 export interface PublishOptions extends SourceOptions {
   readonly gateway: string;
+  /**
+   * Gateways every chunk is also written to, for propagation. Absent means the
+   * default set; empty means none. See `swarm.ts`.
+   */
+  readonly mirrors?: readonly string[] | undefined;
   readonly windowSize: number;
   /** Stream topic. A fresh UUID by default, as the deployed publishers use. */
   readonly topicRaw?: string | undefined;
@@ -48,7 +59,14 @@ export interface PublishOptions extends SourceOptions {
 }
 
 export type PublishEvent =
-  | { kind: 'started'; owner: string; topicRaw: string; topicHex: string; gateway: string }
+  | {
+      kind: 'started';
+      owner: string;
+      topicRaw: string;
+      topicHex: string;
+      gateway: string;
+      mirrors: string[];
+    }
   | {
       kind: 'segment';
       segment: number;
@@ -61,6 +79,7 @@ export type PublishEvent =
     }
   | { kind: 'registered'; state: 'live' | 'vod' }
   | { kind: 'finalized'; feedIndex: number; segments: number; duration: number }
+  | { kind: 'mirrors'; mirrors: MirrorReport[] }
   | { kind: 'warning'; message: string };
 
 /**
@@ -80,9 +99,10 @@ export async function publishLive(
   signal: AbortSignal,
   report: (event: PublishEvent) => void,
 ): Promise<void> {
-  const bee = makeBee(options.gateway);
+  const writer = SwarmWriter.open(options.gateway, options.mirrors ?? DEFAULT_MIRRORS);
+  writer.onWarning((message) => report({ kind: 'warning', message }));
   const signer = resolveSigner(options.privateKey);
-  const feed = FeedPublisher.create(bee, options.topicRaw ?? randomUUID(), signer);
+  const feed = FeedPublisher.create(writer, options.topicRaw ?? randomUUID(), signer);
   const manifest = new ManifestManager({
     baseUrl: `${options.gateway.replace(/\/$/, '')}/bytes`,
     windowSize: options.windowSize,
@@ -94,10 +114,11 @@ export async function publishLive(
     topicRaw: feed.topicRaw,
     topicHex: feed.topicHex,
     gateway: options.gateway,
+    mirrors: writer.mirrorGateways,
   });
 
   const registry = options.registry
-    ? await Registry.open(bee, REGISTRY_TOPIC, signer)
+    ? await Registry.open(writer, REGISTRY_TOPIC, signer)
     : null;
   let announced = false;
 
@@ -113,7 +134,7 @@ export async function publishLive(
   for await (const raw of hlsSegments(options, signal)) {
     const body = await readFile(raw.path);
     const uploadStarted = Date.now();
-    const ref = await uploadSegment(bee, body);
+    const ref = await uploadSegment(writer, body);
     const uploadMs = Date.now() - uploadStarted;
 
     manifest.addSegment({ index: raw.index, duration: raw.duration, ref });
@@ -148,6 +169,7 @@ export async function publishLive(
   const vod = manifest.buildVod();
   if (!vod) {
     report({ kind: 'warning', message: 'no segments were produced; nothing to finalize' });
+    report({ kind: 'mirrors', mirrors: writer.report() });
     return;
   }
   const feedIndex = await feed.write(vod);
@@ -168,6 +190,12 @@ export async function publishLive(
     });
     report({ kind: 'registered', state: 'vod' });
   }
+
+  // The closing update is the one a late viewer resolves the whole stream
+  // through, so it is worth waiting for the mirrors to have it. Everything
+  // before it was already answered by the primary.
+  await writer.drain();
+  report({ kind: 'mirrors', mirrors: writer.report() });
 }
 
 function entryFor(feed: FeedPublisher, state: 'live' | 'vod') {
@@ -181,4 +209,4 @@ function entryFor(feed: FeedPublisher, state: 'live' | 'vod') {
   };
 }
 
-export { DEFAULT_GATEWAY };
+export { DEFAULT_GATEWAY, DEFAULT_MIRRORS };

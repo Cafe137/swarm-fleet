@@ -41,7 +41,9 @@ export type ViewerOutcome =
   | 'stalled_out'
   | 'crashed'
   | 'killed'
-  | 'never_joined';
+  | 'never_joined'
+  /** Its machine left the fleet, so nothing more was ever heard from it. */
+  | 'agent_lost';
 
 export interface ViewerExit {
   code: number | null;
@@ -121,6 +123,13 @@ export interface ViewerRecord {
   malformedLines: number;
   errors: { stage: string; message: string }[];
   summarySeen: boolean;
+  /**
+   * Controller clock instant this viewer's agent went silent, if it did.
+   *
+   * Everything before it is real and is kept; everything after it is unknown.
+   * A viewer is not judged on the numbers it would have reported.
+   */
+  agentLostAtMs?: number | undefined;
 }
 
 export interface ViewerIdentity {
@@ -360,9 +369,26 @@ export class ViewerRollup {
     }
   }
 
+  /**
+   * Its machine stopped answering, so this record ends here.
+   *
+   * The agent dies with its control channel and kills its viewers, so this
+   * viewer is gone — but it never reports an exit, and without this it would
+   * read as `running` for the rest of the run and be counted among the viewers
+   * the fleet was generating load with.
+   */
+  noteAgentLost(atMs: number): void {
+    this.record.agentLostAtMs ??= atMs;
+  }
+
   noteExit(exit: ViewerExit, atMs: number): void {
     this.record.exit = exit;
     this.record.exitedAtMs = atMs;
+  }
+
+  /** Which machine this viewer is on, so a lost one can find its viewers. */
+  get agent(): string {
+    return this.record.agent;
   }
 
   /** Snapshot with the derived fields computed. Safe to call mid-run. */
@@ -386,7 +412,10 @@ export class ViewerRollup {
 function classify(record: ViewerRecord): ViewerOutcome {
   const exit = record.exit;
   if (exit === undefined) {
-    return 'running';
+    // A viewer whose agent went silent is not still running: whatever the
+    // machine did after that, this controller cannot see it and will not
+    // count it.
+    return record.agentLostAtMs === undefined ? 'running' : 'agent_lost';
   }
   // A signal we sent is not a crash; a signal we did not send is.
   const crashed = exit.requested

@@ -24,6 +24,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { publishLive, type PublishEvent, resolveSigner } from './publisher.js';
+import type { MirrorReport } from './swarm.js';
 import { type PublisherConfig, segmentsBeforeViewersCanJoin } from './config.js';
 import type { StreamRef } from '../transport/protocol.js';
 
@@ -51,6 +52,14 @@ export interface PublisherStats {
   owner: string;
   topic: string;
   gateway: string;
+  /**
+   * The gateways every chunk was also written to, and how they behaved.
+   *
+   * Kept in the run record because it changes how fast a segment becomes
+   * findable, and therefore what the viewers' fetch times mean: a run where
+   * every mirror was disabled is not comparable to one where they were not.
+   */
+  mirrors: MirrorReport[];
   segments: number;
   bytes: number;
   /** Last feed index written. The feed counts manifests, not segments. */
@@ -104,6 +113,13 @@ export async function startPublisher(
           owner: event.owner,
           topic: event.topicRaw,
           gateway: event.gateway,
+          mirrors: event.mirrors.map((gateway) => ({
+            gateway,
+            ok: 0,
+            failed: 0,
+            dropped: 0,
+            disabled: false,
+          })),
           segments: 0,
           bytes: 0,
           feedIndex: undefined,
@@ -114,7 +130,13 @@ export async function startPublisher(
           warnings: [],
           startedAt: new Date().toISOString(),
         };
-        log('info', `stream ${event.owner}:${event.topicRaw} through ${event.gateway}`);
+        log(
+          'info',
+          `stream ${event.owner}:${event.topicRaw} through ${event.gateway}` +
+            (event.mirrors.length === 0
+              ? ''
+              : `, mirrored to ${event.mirrors.join(', ')}`),
+        );
         resolveStarted?.({ owner: event.owner, topic: event.topicRaw });
         break;
       case 'segment': {
@@ -145,6 +167,20 @@ export async function startPublisher(
           stats.feedIndex = event.feedIndex;
         }
         break;
+      case 'mirrors':
+        if (stats !== undefined) {
+          stats.mirrors = event.mirrors;
+        }
+        for (const mirror of event.mirrors) {
+          log(
+            'info',
+            `mirror ${mirror.gateway}: ${mirror.ok} written` +
+              (mirror.failed > 0 ? `, ${mirror.failed} failed` : '') +
+              (mirror.dropped > 0 ? `, ${mirror.dropped} skipped` : '') +
+              (mirror.disabled ? ', abandoned' : ''),
+          );
+        }
+        break;
       case 'registered':
         log('info', `catalog entry written as ${event.state}`);
         break;
@@ -162,6 +198,7 @@ export async function startPublisher(
       size: config.size,
       bitrate: config.bitrate,
       gateway: config.gateway,
+      mirrors: config.mirrors,
       windowSize: config.windowSize,
       registry: config.registry,
       ...(config.topic === undefined ? {} : { topicRaw: config.topic }),
@@ -193,7 +230,11 @@ export async function startPublisher(
     if (stats === undefined) {
       throw new Error('the publisher reported no stream');
     }
-    return { ...stats, warnings: [...stats.warnings] };
+    return {
+      ...stats,
+      mirrors: stats.mirrors.map((mirror) => ({ ...mirror })),
+      warnings: [...stats.warnings],
+    };
   };
 
   return {

@@ -11,18 +11,28 @@
  *
  * Both are guaranteed here by allocating the index synchronously and serializing
  * the uploads behind a promise chain.
+ *
+ * Each update is written to the mirror gateways as well, through `SwarmWriter`.
+ * The ordering above survives that, because a mirror write is started inside the
+ * serialized chain: index n+1 is not dispatched anywhere until index n has
+ * landed on the primary. A mirror write completing late can only duplicate a
+ * chunk that is already in the network, never open a hole in front of one.
+ *
+ * Signing is deterministic (RFC 6979), so the same index and payload produce a
+ * byte-identical single-owner chunk at every gateway — there is one feed, not
+ * one per gateway.
  */
 
-import { Bee, FeedIndex, PrivateKey, Topic } from '@ethersphere/bee-js';
+import { FeedIndex, PrivateKey, Topic } from '@ethersphere/bee-js';
 
-import { withRetry, ZERO_BATCH } from './swarm.js';
+import { SwarmWriter, UPLOAD_OPTIONS, ZERO_BATCH } from './swarm.js';
 
 export class FeedPublisher {
   private nextIndex = 0;
   private tail: Promise<unknown> = Promise.resolve();
 
   private constructor(
-    private readonly bee: Bee,
+    private readonly writer: SwarmWriter,
     private readonly topic: Topic,
     private readonly signer: PrivateKey,
     readonly topicRaw: string,
@@ -33,8 +43,8 @@ export class FeedPublisher {
    * same keccak256-of-the-string that the viewer's `normalize_feed_topic`
    * applies. Stream UUIDs therefore go in raw on both sides.
    */
-  static create(bee: Bee, topicRaw: string, signer: PrivateKey): FeedPublisher {
-    return new FeedPublisher(bee, Topic.fromString(topicRaw), signer, topicRaw);
+  static create(writer: SwarmWriter, topicRaw: string, signer: PrivateKey): FeedPublisher {
+    return new FeedPublisher(writer, Topic.fromString(topicRaw), signer, topicRaw);
   }
 
   get owner(): string {
@@ -55,9 +65,9 @@ export class FeedPublisher {
     const index = this.nextIndex;
     this.nextIndex += 1;
     const run = this.tail.then(async () => {
-      const writer = this.bee.feed.makeWriter(this.topic, this.signer);
-      await withRetry(() =>
-        writer.uploadPayload(ZERO_BATCH, payload, {
+      await this.writer.fanOut((bee) =>
+        bee.feed.makeWriter(this.topic, this.signer).uploadPayload(ZERO_BATCH, payload, {
+          ...UPLOAD_OPTIONS,
           index: FeedIndex.fromBigInt(BigInt(index)),
         }),
       );

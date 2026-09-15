@@ -12,6 +12,32 @@ import { z } from 'zod';
 export const DEFAULT_GATEWAY = 'https://bzz.limo';
 
 /**
+ * Gateways the publisher writes every chunk to *as well as* the primary.
+ *
+ * Not redundancy — propagation. An upload is only useful to a viewer once some
+ * node other than the uploader can serve it, and the two public gateways differ
+ * sharply in how fast that happens. Measured 2026-09-15, uploading a unique
+ * 500 KB blob (one 2 s segment at 2 Mbps) to one gateway and polling the other
+ * until it served it, four rounds each way:
+ *
+ * | Uploaded to | Findable elsewhere after |
+ * | --- | --- |
+ * | `api.gateway.ethswarm.org` | 567, 586, 712, 804 ms |
+ * | `bzz.limo` | 2192, 2258, 2583, 2826 ms |
+ *
+ * At a 2 s segment duration a bzz.limo-only segment is, on average, still
+ * unfindable when the *next* one is published — which is the most likely
+ * mechanism behind the 2-5% of segments a live viewer cannot retrieve at the
+ * edge. Writing both places in parallel makes the time-to-findable the faster
+ * of the two, and costs the publisher nothing it was not already spending on
+ * ffmpeg.
+ *
+ * The same measurement is why `deferred: false` is set on every upload — see
+ * `swarm.ts`.
+ */
+export const DEFAULT_MIRRORS: readonly string[] = ['https://api.gateway.ethswarm.org'];
+
+/**
  * Seconds of contiguous playlist a viewer needs behind the live edge before it
  * can join at all — `HLS_LIVE_STARTUP_BUFFER_SECONDS` in the viewer
  * (`stream_hls.rs`). A fleet launched against a stream younger than this does
@@ -40,6 +66,11 @@ export const PublisherConfig = z.object({
    */
   bitrate: z.string().default('1800k'),
   gateway: z.string().default(DEFAULT_GATEWAY),
+  /**
+   * Extra gateways every chunk is also written to, for propagation. Empty
+   * disables mirroring; a mirror never gates the stream (see `swarm.ts`).
+   */
+  mirrors: z.array(z.string()).default([...DEFAULT_MIRRORS]),
   /** Stream topic; a fresh UUID when absent, as the deployed publishers use. */
   topic: z.string().optional(),
   registry: z.boolean().default(false),

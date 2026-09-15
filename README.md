@@ -300,6 +300,29 @@ The controller should not host viewers in a real run — its own Node process la
 same CPU and memory budget as the viewers — so name every machine explicitly rather than
 leaving the default `local` agent in place.
 
+### A machine that drops out shrinks the fleet; it does not stall it
+
+A control channel dies with the machine behind it — the agent is attached to that pipe and
+kills its own viewers when it closes — so there is nothing to reconnect to. What recovery
+means is stopping the *other* machines waiting for it:
+
+-   the fleet's size, its per-agent targets and the `--settle` barrier are all recomputed over
+    the machines that are still answering, so a cohort is released when the viewers that still
+    exist are holding their peers;
+-   the lost machine's viewers stop being counted as running. They are their own outcome,
+    `agent_lost`, and are left out of the peer-attainment judgement, so an ssh failure is not
+    reported as Swarm losing peers;
+-   the run continues, is marked **invalid** naming the machine and the last line ssh wrote
+    before the pipe closed, and carries a caveat saying how much of the fleet was left;
+-   the survivors are **not** given the lost machine's share. They were sized and admitted for
+    their own, and starting another fifty viewers on each mid-run would trade a fleet that is
+    smaller than requested for one that is overloaded.
+
+This was written after a 20-machine, 1000-viewer settled run lost two boxes during the join:
+the other 900 viewers sat parked at the barrier, peered and watching nothing, until the run
+was killed — because the barrier was still waiting for 100 viewers on machines that no longer
+existed.
+
 ## Renting the machines
 
 `provision` rents boxes from Vultr, installs what an agent needs, and hands back the

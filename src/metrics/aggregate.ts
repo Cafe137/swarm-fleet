@@ -73,6 +73,7 @@ const EMPTY_OUTCOMES: Record<ViewerOutcome, number> = {
   crashed: 0,
   killed: 0,
   never_joined: 0,
+  agent_lost: 0,
 };
 
 /**

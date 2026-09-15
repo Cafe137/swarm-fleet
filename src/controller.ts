@@ -131,6 +131,8 @@ export interface AgentSnapshot {
   admissionReason?: string | undefined;
   /** Name of the first breached guard on this machine, if any. */
   breachedGuard?: string | undefined;
+  /** Why this machine left the fleet, if it did. Its numbers stop here. */
+  lost?: string | undefined;
 }
 
 export interface RunResult {
@@ -180,6 +182,9 @@ interface AgentLink {
   ready: boolean;
   helloSeen: boolean;
   collectDone: boolean;
+  /** Why this machine left the fleet, if it did. Set when its channel dies. */
+  lost?: string | undefined;
+  lostAtMs?: number | undefined;
   /** Last few lines ssh wrote to stderr, kept to explain a silent agent. */
   sshStderr: string[];
   incoming: Map<string, WriteStream>;
@@ -198,6 +203,32 @@ export interface ControllerHooks {
    */
   onSettled?: () => Promise<void>;
 }
+
+/** What `connect` needs back to drive one machine. */
+export interface AgentConnection {
+  channel: Channel<ToAgent, FromAgent>;
+  /** Cuts the pipe. Only a remote agent has one; a local one is in-process. */
+  kill?: (() => void) | undefined;
+}
+
+export type AgentTransport = (
+  target: ResolvedScenario['agents'][number],
+  observe: {
+    onStderr: (line: string) => void;
+    onMalformed: (line: string, reason: string) => void;
+  },
+) => AgentConnection;
+
+const defaultTransport: AgentTransport = (target, observe) => {
+  if (target.host === 'local') {
+    const pair = localChannelPair();
+    const agent = new FleetAgent(pair.agentSide);
+    void agent.start();
+    return { channel: pair.controllerSide };
+  }
+  const connection = sshChannel(target, observe.onStderr, observe.onMalformed);
+  return { channel: connection.channel, kill: connection.kill };
+};
 
 export class Controller {
   private readonly links: AgentLink[] = [];
@@ -227,6 +258,13 @@ export class Controller {
     private readonly runId: string,
     private readonly runDir: string,
     private readonly hooks: ControllerHooks = {},
+    /**
+     * How a machine is reached. The default is in-process for `local` and ssh
+     * for everything else; a test replaces it to hold one end of a channel and
+     * cut it, which is the only way to exercise a fleet losing a machine
+     * without an ssh server and a network to break.
+     */
+    private readonly transport: AgentTransport = defaultTransport,
   ) {}
 
   async run(force: boolean): Promise<RunResult> {
@@ -287,29 +325,18 @@ export class Controller {
         viewersStarted: 0,
       };
 
-      let channel: Channel<ToAgent, FromAgent>;
-      let kill: (() => void) | undefined;
       const sshStderr: string[] = [];
-      if (target.host === 'local') {
-        const pair = localChannelPair();
-        channel = pair.controllerSide;
-        const agent = new FleetAgent(pair.agentSide);
-        void agent.start();
-      } else {
-        const connection = sshChannel(
-          target,
-          (line) => {
-            sshStderr.push(line);
-            if (sshStderr.length > SSH_STDERR_TAIL) {
-              sshStderr.shift();
-            }
-            this.hooks.onLog?.('warn', `${name}: ssh: ${line}`);
-          },
-          (_line, reason) => this.hooks.onLog?.('warn', `${name}: bad control line (${reason})`),
-        );
-        channel = connection.channel;
-        kill = connection.kill;
-      }
+      const { channel, kill } = this.transport(target, {
+        onStderr: (line) => {
+          sshStderr.push(line);
+          if (sshStderr.length > SSH_STDERR_TAIL) {
+            sshStderr.shift();
+          }
+          this.hooks.onLog?.('warn', `${name}: ssh: ${line}`);
+        },
+        onMalformed: (_line, reason) =>
+          this.hooks.onLog?.('warn', `${name}: bad control line (${reason})`),
+      });
 
       const link: AgentLink = {
         report,
@@ -333,20 +360,21 @@ export class Controller {
       channel.onMessage((message) => this.onAgentMessage(link, message));
       channel.onClose((reason) => {
         if (!link.collectDone) {
-          this.invalid(`agent ${name} disconnected (${reason ?? 'unknown'})`);
+          this.loseAgent(link, reason ?? 'unknown');
         }
       });
     });
 
     try {
       await this.waitFor(
-        () => this.links.every((link) => link.helloSeen),
+        () => this.liveLinks().every((link) => link.helloSeen),
         HELLO_TIMEOUT_MS,
         'agents did not say hello',
       );
     } catch {
       throw new Error(this.silentAgentReport());
     }
+    this.requireFleet();
   }
 
   /**
@@ -398,7 +426,7 @@ export class Controller {
    * and a burst of back-to-back pings would all land in the same warm-up.
    */
   private async measureClocks(): Promise<void> {
-    for (const link of this.links) {
+    for (const link of this.liveLinks()) {
       let best: { rttMs: number; offsetMs: number } | undefined;
       for (let probe = 0; probe < CLOCK_PINGS; probe += 1) {
         const sentAt = Date.now();
@@ -431,7 +459,7 @@ export class Controller {
   private readonly pendingPongs = new Map<string, (agentClockMs: number) => void>();
 
   private async configure(): Promise<void> {
-    for (const [index, link] of this.links.entries()) {
+    for (const [index, link] of this.liveLinks().entries()) {
       link.channel.send({
         kind: 'configure',
         runId: this.runId,
@@ -451,13 +479,14 @@ export class Controller {
 
   private async awaitReady(force: boolean): Promise<void> {
     await this.waitFor(
-      () => this.links.every((link) => link.ready),
+      () => this.liveLinks().every((link) => link.ready),
       READY_TIMEOUT_MS,
       'agents did not finish preflight',
     );
+    this.requireFleet();
 
     const failures: string[] = [];
-    for (const link of this.links) {
+    for (const link of this.liveLinks()) {
       for (const check of link.report.preflight?.checks ?? []) {
         if (!check.ok && check.fatal) {
           failures.push(`${link.report.name}: ${check.name}: ${check.detail}`);
@@ -467,7 +496,7 @@ export class Controller {
     // Every agent must be running the same build, or the run is measuring two
     // different viewers and reporting one number.
     const binaries = new Set(
-      this.links
+      this.liveLinks()
         .map((link) => link.report.preflight?.binarySha256)
         .filter((sha): sha is string => sha !== undefined),
     );
@@ -510,8 +539,12 @@ export class Controller {
    */
   private setTotalTarget(total: number, replacements: 'none' | 'bounded' | 'live'): void {
     this.requested = Math.max(this.requested, total);
-    const shares = partition(total, this.links.map((link) => link.report.weight));
-    this.links.forEach((link, index) => {
+    // Shared out among the machines that are still answering: a lost agent's
+    // share would otherwise be viewers nobody starts, held against a target
+    // nobody can reach.
+    const live = this.liveLinks();
+    const shares = partition(total, live.map((link) => link.report.weight));
+    live.forEach((link, index) => {
       const share = Math.min(shares[index] as number, link.report.maxViewers);
       const totalStarts =
         replacements === 'none' ? share : share + Math.ceil(share * 0.25) + 5;
@@ -540,9 +573,109 @@ export class Controller {
    */
   private sessionTarget = 0;
 
-  /** The most viewers any one agent will accept, summed. */
+  /** The most viewers any one agent will accept, summed over the live fleet. */
   capacity(): number {
-    return this.links.reduce((sum, link) => sum + link.report.maxViewers, 0);
+    return this.liveLinks().reduce((sum, link) => sum + link.report.maxViewers, 0);
+  }
+
+  /** The machines still answering. Every question about fleet size asks this. */
+  private liveLinks(): AgentLink[] {
+    return this.links.filter((link) => link.lost === undefined);
+  }
+
+  /**
+   * Refuse to start a run with nothing to run it on.
+   *
+   * Losing machines before the first viewer starts is tolerated the same way as
+   * losing them mid-run — the fleet shrinks — but `every` over an empty fleet
+   * is vacuously true, so without this a run that lost every agent during
+   * preflight would sail through both waits and report a clean cohort of zero.
+   */
+  private requireFleet(): void {
+    if (this.liveLinks().length > 0) {
+      return;
+    }
+    throw new Error(
+      `every agent disconnected before the run started:\n  ` +
+        this.links.map((link) => `${link.report.name}: ${link.lost ?? 'unknown'}`).join('\n  '),
+    );
+  }
+
+  /**
+   * Write a machine off, and carry on with the fleet that is left.
+   *
+   * There is nothing to reconnect to. The agent is attached to this pipe and
+   * kills its own viewers when it closes, so a lost control channel is a lost
+   * machine and a lost machine is 50 lost viewers. What recovery means here is
+   * not getting that box back — it is stopping the other nineteen from waiting
+   * for it.
+   *
+   * That waiting was the whole failure. A settled cohort releases when every
+   * viewer it asked for is holding its peers; a dead agent's share never will
+   * be, so a 20-machine run that lost two boxes left 900 viewers parked at the
+   * barrier, peered and watching nothing, until the settle deadline. Zeroing
+   * the machine's counters and taking it out of `liveLinks` is what lets the
+   * barrier open on the fleet that is actually there.
+   *
+   * The run is invalid either way — it generated less load than it was asked
+   * for, and nothing here changes that. But an invalid run that measured 900
+   * viewers is worth having, and a cohort that never watched anything is not.
+   *
+   * The survivors are deliberately *not* asked to take the lost machine's
+   * share. Each was sized and admitted for its own, and handing it another
+   * fifty viewers mid-run would trade a fleet that is smaller than requested
+   * for one that is overloaded — which invalidates the numbers the survivors
+   * were still producing correctly.
+   */
+  private loseAgent(link: AgentLink, channelReason: string): void {
+    if (link.lost !== undefined) {
+      return;
+    }
+    const lostViewers = link.active;
+    // The channel only knows that its pipe ended. Why it ended — a timeout, a
+    // reset, an out-of-memory kill on the far side — is on ssh's stderr, and
+    // that is the line worth having in the report a week later.
+    const reason =
+      link.sshStderr.length > 0
+        ? `${channelReason}: ${link.sshStderr[link.sshStderr.length - 1] as string}`
+        : channelReason;
+    link.lost = reason;
+    link.lostAtMs = Date.now();
+    // Its counters are the last thing it said, not what is true now: nothing on
+    // that machine is running any more. Zeroing them keeps every "how many
+    // viewers are up" sum honest, and `stopAll` from waiting out a grace period
+    // for viewers that cannot answer.
+    link.target = 0;
+    link.active = 0;
+    link.bootstrapping = 0;
+    link.held = 0;
+    link.startsExhausted = true;
+    // Nothing more will arrive from it, so `collect` must not wait for its
+    // files either.
+    link.collectDone = true;
+    const lostAtMs = link.lostAtMs;
+    for (const rollup of this.rollups.values()) {
+      if (rollup.agent === link.report.name) {
+        rollup.noteAgentLost(lostAtMs);
+      }
+    }
+    const remaining = this.liveLinks().length;
+    this.hooks.onLog?.(
+      'error',
+      `agent ${link.report.name} disconnected (${reason}); ${lostViewers} viewer(s) went ` +
+        `with it. Continuing on ${remaining} of ${this.links.length} machines`,
+    );
+    this.judge(
+      `agent ${link.report.name} disconnected (${reason}), taking ${lostViewers} viewer(s) ` +
+        'with it: the fleet was smaller than this run asked for',
+    );
+    if (remaining === 0) {
+      // Nothing is generating load and nothing ever will be again. Ending here
+      // rather than at the run ceiling is the difference between a report in a
+      // second and one in ten minutes.
+      this.aborted = true;
+      this.stoppedBecause = 'every agent disconnected';
+    }
   }
 
   /** What the session is holding right now. */
@@ -618,7 +751,7 @@ export class Controller {
     // Viewers bounded by `--segments` or `--duration` end on their own; the
     // run is over when every requested viewer has started and none is left.
     const spent = (): boolean =>
-      this.links.every((link) => link.startsExhausted || link.target === 0);
+      this.liveLinks().every((link) => link.startsExhausted || link.target === 0);
     const finished = (): boolean => spent() && this.totalActive() === 0;
 
     await this.waitFor(
@@ -702,25 +835,40 @@ export class Controller {
    * actually means "done dialing". A viewer that falls short of the target is
    * not fatal — the phase has a deadline, and a shortfall is recorded rather
    * than being allowed to hang a run that is otherwise fine.
+   *
+   * The target is re-read on every pass rather than fixed at the start, because
+   * the fleet can shrink while the cohort is settling. A machine whose control
+   * channel dies takes its share of the cohort with it and will never hold
+   * anything again; counting it would leave every other viewer parked at the
+   * barrier until the deadline, which is exactly what a 20-machine run did when
+   * two boxes dropped — 900 viewers sat peered and idle, watching nothing, for
+   * the rest of the settle timeout.
    */
   private async settleAndRelease(total: number): Promise<void> {
     const settle = this.scenario.settle;
     if (settle === undefined) {
       return;
     }
-    const capacity = this.links.reduce((sum, link) => sum + link.report.maxViewers, 0);
-    const target = Math.min(total, capacity);
+    const target = (): number => Math.min(total, this.capacity());
     this.hooks.onLog?.(
       'info',
-      `settling: waiting for ${target} viewers to hold ${settle.peerUp} peers each`,
+      `settling: waiting for ${target()} viewers to hold ${settle.peerUp} peers each`,
     );
 
+    // Only viewers on machines still in the fleet: a lost agent's viewers were
+    // killed with it, and the last thing they said about their peers is no
+    // longer true of anything that is running.
     const ready = (): ViewerRecord[] =>
       this.records().filter(
-        (record) => record.held && (record.peersLast ?? 0) >= settle.peerUp,
+        (record) =>
+          record.outcome !== 'agent_lost' &&
+          record.held === true &&
+          (record.peersLast ?? 0) >= settle.peerUp,
       );
+    const started = (): number =>
+      this.liveLinks().reduce((count, link) => count + link.started, 0);
     await this.waitFor(
-      () => this.aborted || (this.totalStarted() >= target && ready().length >= target),
+      () => this.aborted || (started() >= target() && ready().length >= target()),
       settle.timeoutS * 1_000,
       undefined,
     );
@@ -732,13 +880,13 @@ export class Controller {
     // a shortfall survives even if the publisher then fails.
     const held = ready().length;
     const settleS = (Date.now() - this.startedAtMs) / 1000;
-    if (held < target) {
+    if (held < target()) {
       const lowest = this.records()
         .filter((record) => record.outcome === 'running')
         .map((record) => record.peersLast ?? 0)
         .sort((left, right) => left - right)[0];
       const detail =
-        `${held} of ${target} viewers were holding ${settle.peerUp} peers after ` +
+        `${held} of ${target()} viewers were holding ${settle.peerUp} peers after ` +
         `${settleS.toFixed(0)}s (${this.totalStarted()} started, lowest peer count ` +
         `${lowest ?? 0})`;
       this.caveat(
@@ -750,7 +898,7 @@ export class Controller {
     } else {
       this.hooks.onLog?.(
         'info',
-        `settled: ${target} viewers holding ${settle.peerUp} peers after ${settleS.toFixed(0)}s`,
+        `settled: ${target()} viewers holding ${settle.peerUp} peers after ${settleS.toFixed(0)}s`,
       );
     }
 
@@ -761,7 +909,7 @@ export class Controller {
     }
 
     this.measuredFromMs = Date.now();
-    for (const link of this.links) {
+    for (const link of this.liveLinks()) {
       link.channel.send({ kind: 'release' });
     }
     this.hooks.onLog?.('info', 'released; the measurement window starts here');
@@ -877,7 +1025,7 @@ export class Controller {
   // ----------------------------------------------------------- shutdown
 
   private async stopAll(): Promise<void> {
-    for (const link of this.links) {
+    for (const link of this.liveLinks()) {
       link.target = 0;
       link.channel.send({ kind: 'stop', graceMs: this.scenario.graceMs });
     }
@@ -897,7 +1045,7 @@ export class Controller {
     this.closeViewerLogs();
     // Only a remote agent has files to ship: a local one writes its viewer logs
     // straight into this run's directory.
-    const remote = this.links.filter((link) => link.report.host !== 'local');
+    const remote = this.liveLinks().filter((link) => link.report.host !== 'local');
     if (remote.length > 0) {
       await mkdir(path.join(this.runDir, 'viewers'), { recursive: true });
       for (const link of remote) {
@@ -918,6 +1066,15 @@ export class Controller {
       link.collectDone = true;
       link.channel.send({ kind: 'shutdown' });
       link.kill?.();
+    }
+    if (this.links.some((link) => link.lost !== undefined)) {
+      const lost = this.links.filter((link) => link.lost !== undefined);
+      this.caveat(
+        `${lost.length} of ${this.links.length} machines left the fleet mid-run ` +
+          `(${lost.map((link) => `${link.report.name}: ${link.lost ?? 'unknown'}`).join('; ')}), ` +
+          'so their viewers stopped generating load and their own records end where the ' +
+          'control channel did. The run continued on the machines that were left.',
+      );
     }
   }
 
@@ -1159,6 +1316,10 @@ export class Controller {
     const now = Date.now();
     return this.records()
       .filter((record) => agent === undefined || record.agent === agent)
+      // A viewer killed with its agent froze its peer count at whatever it had
+      // when the pipe died. Judging that as starved or evicted would report an
+      // ssh failure as a Swarm one.
+      .filter((record) => record.outcome !== 'agent_lost')
       .map((record) => ({
         target: record.peerLimit,
         peak: record.peersMax ?? 0,
@@ -1231,6 +1392,7 @@ export class Controller {
       establishedSockets: sample?.establishedSockets,
       admissionReason: link.admissionReason,
       breachedGuard: breached?.name,
+      lost: link.lost,
     };
   }
 
@@ -1370,7 +1532,10 @@ export class Controller {
     // returned `no_data` rather than `ok`, and an unguarded run is not a
     // measurement. A run shorter than a few sample periods is exempt.
     const expectSamples = durationS > (this.scenario.sampleIntervalMs / 1000) * 3;
-    for (const agent of this.agents()) {
+    // A machine that left the fleet has already been reported as leaving; it
+    // stopped sampling because it stopped existing, which is not a second
+    // finding about the rig.
+    for (const agent of this.liveLinks().map((link) => link.report)) {
       if (expectSamples && agent.samples.length === 0) {
         this.judge(
           `agent ${agent.name} produced no resource samples in ${durationS.toFixed(0)}s, ` +

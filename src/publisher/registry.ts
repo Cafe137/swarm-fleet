@@ -11,9 +11,9 @@
  * to accept either shape.
  */
 
-import { Bee, FeedIndex, PrivateKey, Topic } from '@ethersphere/bee-js';
+import { FeedIndex, PrivateKey, Topic } from '@ethersphere/bee-js';
 
-import { withRetry, ZERO_BATCH } from './swarm.js';
+import { SwarmWriter, UPLOAD_OPTIONS, ZERO_BATCH } from './swarm.js';
 
 export type StreamState = 'live' | 'vod';
 
@@ -30,23 +30,25 @@ export interface RegistryEntry {
 
 export class Registry {
   private constructor(
-    private readonly bee: Bee,
+    private readonly writer: SwarmWriter,
     private readonly topic: Topic,
     private readonly signer: PrivateKey,
     private index: bigint | null,
     private entries: RegistryEntry[],
   ) {}
 
-  static async open(bee: Bee, topicRaw: string, signer: PrivateKey): Promise<Registry> {
+  static async open(writer: SwarmWriter, topicRaw: string, signer: PrivateKey): Promise<Registry> {
     const topic = Topic.fromString(topicRaw);
     const owner = signer.publicKey().address();
     try {
-      const current = await bee.feed.makeReader(topic, owner).downloadPayload();
+      // Read from the primary only: the current entries have one right answer,
+      // and asking every mirror for it would just be slower.
+      const current = await writer.primary.feed.makeReader(topic, owner).downloadPayload();
       const entries = current.payload.toJSON() as RegistryEntry[];
-      return new Registry(bee, topic, signer, current.feedIndex.toBigInt(), entries);
+      return new Registry(writer, topic, signer, current.feedIndex.toBigInt(), entries);
     } catch {
       // 404 means the topic was never used, 503 that it has no entries yet.
-      return new Registry(bee, topic, signer, null, []);
+      return new Registry(writer, topic, signer, null, []);
     }
   }
 
@@ -58,9 +60,10 @@ export class Registry {
     this.entries.push(entry);
 
     const next = this.index === null ? 0n : this.index + 1n;
-    const writer = this.bee.feed.makeWriter(this.topic, this.signer);
-    await withRetry(() =>
-      writer.uploadPayload(ZERO_BATCH, JSON.stringify(this.entries), {
+    const payload = JSON.stringify(this.entries);
+    await this.writer.fanOut((bee) =>
+      bee.feed.makeWriter(this.topic, this.signer).uploadPayload(ZERO_BATCH, payload, {
+        ...UPLOAD_OPTIONS,
         index: FeedIndex.fromBigInt(next),
       }),
     );

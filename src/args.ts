@@ -63,6 +63,8 @@ export const BOOLEAN_FLAGS = new Set([
   '--deploy',
   '--from-github',
   '--publish',
+  '--no-mirror',
+  '--publish-no-mirror',
   '--settle',
   '--no-settle',
   '--verify',

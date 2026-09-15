@@ -117,6 +117,9 @@ run options:
   --publish-duration <s> stream length; omit to run until the fleet stops
   --publish-segment-duration <s> / --publish-window <n>
   --publish-size <WxH> / --publish-bitrate <rate> / --publish-gateway <url>
+  --publish-mirror <url> repeatable; also write every chunk here, so it becomes
+                         findable sooner  (default https://api.gateway.ethswarm.org)
+  --publish-no-mirror    write to --publish-gateway only
   --publish-topic <s>    stream topic                       (default a fresh UUID)
   --publish-registry     also write a catalog entry
   --deploy               push the viewer and the agent to every --agent host first
@@ -134,6 +137,9 @@ publish options:
   --segment-duration <s>   target segment length                (default 2)
   --window <n>             segments kept in the live manifest   (default 10)
   --size <WxH> --bitrate <rate> --gateway <url> --topic <string>
+  --mirror <url>           repeatable; also write every chunk here, so it becomes
+                           findable sooner (default https://api.gateway.ethswarm.org)
+  --no-mirror              write to --gateway only
   --registry               also write a catalog entry
   --dump <dir>             save every published manifest here
 
@@ -343,6 +349,16 @@ async function runFleet(args: Args): Promise<number> {
           `${stats.finalized ? 'finalized as VOD' : 'not finalized'}\n` +
           `           re-watch it with: --stream ${stats.owner}:${stats.topic}\n`,
       );
+      // A mirror that stopped taking writes changes how fast a segment became
+      // findable, and so what the viewers' fetch times in this run mean. Say so
+      // here rather than leaving it in publisher.json for someone to notice.
+      for (const mirror of stats.mirrors.filter((m) => m.disabled || m.dropped > 0)) {
+        process.stderr.write(
+          `publisher: mirror ${mirror.gateway} ${mirror.disabled ? 'was abandoned' : 'fell behind'}` +
+            ` after ${mirror.ok} writes (${mirror.failed} failed, ${mirror.dropped} skipped);` +
+            ' segments propagated more slowly than a clean run\n',
+        );
+      }
     }
   }
 
@@ -601,6 +617,19 @@ async function stopPublisher(
   }
 }
 
+/**
+ * `--mirror` replaces the default set rather than adding to it, so a run can
+ * name exactly the gateways it wants. `--no-mirror` is the way to ask for none;
+ * `undefined` leaves the config default alone.
+ */
+function mirrorsFromArgs(args: Args, flag: string, off: string): string[] | undefined {
+  if (args.has(off)) {
+    return [];
+  }
+  const named = args.values(flag);
+  return named.length === 0 ? undefined : named;
+}
+
 function publisherFromArgs(
   args: Args,
   base: Scenario['publisher'],
@@ -613,6 +642,7 @@ function publisherFromArgs(
     size: args.value('publish-size'),
     bitrate: args.value('publish-bitrate'),
     gateway: args.value('publish-gateway'),
+    mirrors: mirrorsFromArgs(args, 'publish-mirror', 'publish-no-mirror'),
     topic: args.value('publish-topic'),
     dumpDir: args.value('publish-dump'),
     registry: args.has('publish-registry') ? true : undefined,
@@ -645,6 +675,7 @@ async function publishCommand(args: Args): Promise<number> {
       size: args.value('size'),
       bitrate: args.value('bitrate'),
       gateway: args.value('gateway'),
+      mirrors: mirrorsFromArgs(args, 'mirror', 'no-mirror'),
       topic: args.value('topic'),
       dumpDir: args.value('dump'),
       registry: args.has('registry') ? true : undefined,

@@ -432,9 +432,11 @@ export function machineCells(agent: AgentSnapshot): Cells<MachineColumn> {
     net: agent.rxMbps === undefined ? '-' : `${agent.rxMbps.toFixed(1)}/${number(agent.txMbps, 1)}`,
     sockets: agent.establishedSockets === undefined ? '-' : String(agent.establishedSockets),
     note:
-      agent.breachedGuard !== undefined
-        ? `BREACHED ${agent.breachedGuard}`
-        : (agent.admissionReason ?? ''),
+      agent.lost !== undefined
+        ? `LOST ${agent.lost}`
+        : agent.breachedGuard !== undefined
+          ? `BREACHED ${agent.breachedGuard}`
+          : (agent.admissionReason ?? ''),
   };
 }
 
@@ -474,7 +476,10 @@ export function machineTable(
       if (key !== 'note' || text === '') {
         return text;
       }
-      return shown[index]?.breachedGuard !== undefined ? pc.red(text) : pc.dim(text);
+      const row = shown[index];
+      return row?.breachedGuard !== undefined || row?.lost !== undefined
+        ? pc.red(text)
+        : pc.dim(text);
     },
   );
   const hidden = agents.length - shown.length;
@@ -511,7 +516,14 @@ function mostTroubled(agents: readonly AgentSnapshot[], keep: number): AgentSnap
 }
 
 function trouble(agent: AgentSnapshot): number {
-  return (agent.breachedGuard === undefined ? 0 : 1) + (agent.cpuUtilisation ?? 0);
+  // A machine that has left the fleet outranks a breach: it is the one thing
+  // on this table that will not fix itself, and the row saying so is how the
+  // person watching finds out their fleet is smaller than they think.
+  return (
+    (agent.lost === undefined ? 0 : 2) +
+    (agent.breachedGuard === undefined ? 0 : 1) +
+    (agent.cpuUtilisation ?? 0)
+  );
 }
 
 // ------------------------------------------------------------ non-terminal
