@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { parseViewerEvent } from './contract.js';
-import { ViewerRollup } from './rollup.js';
+import { DEGRADED_STALL_RATIO, TRAILING_STALL_WINDOW_S, ViewerRollup } from './rollup.js';
 
 const identity = {
   viewerId: 'host-0000',
@@ -39,6 +39,74 @@ test('stall ratio is stalled time over media time', () => {
   assert.equal(record.stalledS, 1);
   assert.equal(record.stallRatio, 0.25);
   assert.equal(record.longestStallS, 1);
+});
+
+test('the trailing ratio lets a viewer stop being degraded once it recovers', () => {
+  // One 3 s stall, then 60 s of clean media at 2 s a segment. Over the whole
+  // run that is still 4.6% and degraded; over the last minute it is nothing.
+  const lines = [
+    '{"t":600,"ev":"segment","sequence":1,"bytes":1,"fetch_ms":500,"segment_s":2,"buffered_s":2}',
+    '{"t":4000,"ev":"segment","sequence":2,"bytes":1,"fetch_ms":3400,"segment_s":2,"buffered_s":0.1,"stalled":true,"stall_s":3}',
+  ];
+  for (let index = 0; index < 31; index += 1) {
+    lines.push(
+      `{"t":${5000 + index * 2000},"ev":"segment","sequence":${3 + index},"bytes":1,"fetch_ms":500,"segment_s":2,"buffered_s":8}`,
+    );
+  }
+  const record = fold(lines).finish();
+
+  assert.equal(record.stalledS, 3);
+  assert.ok((record.stallRatio ?? 0) > DEGRADED_STALL_RATIO, 'lifetime ratio still counts it');
+  assert.equal(record.trailingStallRatio, 0);
+  assert.ok((record.trailingMediaS ?? 0) <= TRAILING_STALL_WINDOW_S + 2);
+});
+
+test('the trailing window is trimmed by media seconds, not by segment count', () => {
+  // 10 s segments: six of them fill the window, so the seventh pushes the
+  // stalled first one out. Counting segments instead would keep it.
+  const lines = [
+    '{"t":1000,"ev":"segment","sequence":1,"bytes":1,"fetch_ms":900,"segment_s":10,"buffered_s":1,"stalled":true,"stall_s":5}',
+  ];
+  for (let index = 0; index < 6; index += 1) {
+    lines.push(
+      `{"t":${11000 + index * 10000},"ev":"segment","sequence":${2 + index},"bytes":1,"fetch_ms":900,"segment_s":10,"buffered_s":9}`,
+    );
+  }
+  const record = fold(lines).finish();
+
+  assert.equal(record.stalls, 1);
+  assert.equal(record.trailingStallRatio, 0);
+});
+
+test('a viewer still inside the window is judged on everything it has', () => {
+  const record = fold([
+    '{"t":600,"ev":"segment","sequence":1,"bytes":1,"fetch_ms":500,"segment_s":2,"buffered_s":2}',
+    '{"t":4000,"ev":"segment","sequence":2,"bytes":1,"fetch_ms":3400,"segment_s":2,"buffered_s":0.1,"stalled":true,"stall_s":1}',
+  ]).finish();
+
+  assert.equal(record.trailingMediaS, 4);
+  assert.equal(record.trailingStallRatio, 0.25);
+  assert.equal(record.stallRatio, 0.25);
+});
+
+test('a viewer that never filled its buffer is flagged, not scored as clean', () => {
+  // Two segments in a minute: it never had a playhead, so it never stalled —
+  // which is the most misleading zero in the report if it is left unqualified.
+  const record = fold([
+    '{"t":30000,"ev":"segment","sequence":1,"bytes":1,"fetch_ms":29000,"segment_s":2,"buffered_s":2,"playing":false}',
+    '{"t":64000,"ev":"segment","sequence":2,"bytes":1,"fetch_ms":34000,"segment_s":2,"buffered_s":4,"playing":false}',
+  ]).finish();
+
+  assert.equal(record.trailingStallRatio, 0);
+  assert.equal(record.stuckPrerolling, true);
+});
+
+test('a viewer from a build with no playing flag is read as playing', () => {
+  // Every fixture captured before pre-roll was separated from stalling.
+  const record = fold([
+    '{"t":600,"ev":"segment","sequence":1,"bytes":1,"fetch_ms":500,"segment_s":2,"buffered_s":2}',
+  ]).finish();
+  assert.equal(record.stuckPrerolling, false);
 });
 
 test('realtime factor is fetch time against playback time', () => {

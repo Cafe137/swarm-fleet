@@ -24,10 +24,21 @@ export interface CohortKpis {
     failed: number;
     byOutcome: Record<ViewerOutcome, number>;
   };
-  /** Share of viewers that lost more than 1% of media time to stalling. */
+  /**
+   * Share of viewers losing more than 1% of media time to stalling, judged
+   * over the trailing window rather than over the run — see
+   * `TRAILING_STALL_WINDOW_S`. Mid-run this is "how many are struggling now";
+   * at the end it is "how many were still struggling when it stopped".
+   */
   degradedFraction?: number | undefined;
   degradedViewers: number;
+  /** The same share over each viewer's whole run. The lifetime verdict. */
+  degradedFractionLifetime?: number | undefined;
+  /** Viewers that fetched media but never filled a buffer to play it from. */
+  stuckPrerolling: number;
   stallRatio: Distribution;
+  /** Per-viewer stall ratios over the trailing window. */
+  trailingStallRatio: Distribution;
   stallFreeFraction?: number | undefined;
   /** Stall events across the fleet. A count, where the ratios are shares. */
   stallsTotal: number;
@@ -82,7 +93,26 @@ export function cohortKpis(
 
   const withMedia = records.filter((record) => record.mediaS > 0);
   const stallRatios = withMedia.map((record) => record.stallRatio ?? 0);
-  const degradedViewers = stallRatios.filter((ratio) => ratio > DEGRADED_STALL_RATIO).length;
+  const lifetimeDegraded = stallRatios.filter((ratio) => ratio > DEGRADED_STALL_RATIO).length;
+  // Judged on the trailing window, falling back to the lifetime ratio for a
+  // viewer that reported a summary but no segment events — there is no window
+  // to compute from, and dropping it would quietly shrink the denominator.
+  const withWindow = records.filter(
+    (record) => (record.trailingMediaS ?? 0) > 0 || record.mediaS > 0,
+  );
+  const trailingRatios = withWindow.map(
+    (record) => record.trailingStallRatio ?? record.stallRatio ?? 0,
+  );
+  // A viewer that never filled its first buffer has a stall ratio of zero
+  // because it never had a playhead to starve. It is the worst case there is,
+  // not the best, so it is degraded by definition.
+  const stuckPrerolling = withWindow.filter((record) => record.stuckPrerolling === true).length;
+  const degradedViewers =
+    withWindow.filter(
+      (record) =>
+        record.stuckPrerolling === true ||
+        (record.trailingStallRatio ?? record.stallRatio ?? 0) > DEGRADED_STALL_RATIO,
+    ).length;
   const joinMs = records
     .filter((record) => record.joinMs !== undefined)
     .map((record) => record.joinMs as number);
@@ -113,9 +143,13 @@ export function cohortKpis(
       failed: byOutcome.crashed + byOutcome.never_joined,
       byOutcome,
     },
-    degradedFraction: withMedia.length > 0 ? degradedViewers / withMedia.length : undefined,
+    degradedFraction: withWindow.length > 0 ? degradedViewers / withWindow.length : undefined,
     degradedViewers,
+    degradedFractionLifetime:
+      withMedia.length > 0 ? lifetimeDegraded / withMedia.length : undefined,
+    stuckPrerolling,
     stallRatio: distribution(stallRatios),
+    trailingStallRatio: distribution(trailingRatios),
     stallsTotal: sum(records.map((record) => record.stalls)),
     stallFreeFraction:
       withMedia.length > 0

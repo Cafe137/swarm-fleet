@@ -16,6 +16,25 @@ export const DEGRADED_STALL_RATIO = 0.01;
 /** Above this, playback was not really watchable at all. */
 export const STALLED_OUT_RATIO = 0.25;
 
+/**
+ * Media seconds the degraded judgement looks back over.
+ *
+ * `stalledS / mediaS` across a whole run answers the wrong question: at a 1%
+ * threshold one 1.5 s hiccup brands a viewer degraded for the next 150 s of
+ * clean playback, and in `--mode session` — which runs for hours — a bad
+ * minute at the start would still be the headline at the end. The question
+ * worth asking is whether a viewer is losing media time *now*.
+ *
+ * 60 s is two things at once: long enough that a single stalled 2 s segment
+ * still shows (3.3%, comfortably over the threshold), and short enough that a
+ * viewer which has recovered stops reading as degraded inside one minute —
+ * four of the 15 s reports a participant sends home.
+ *
+ * The lifetime ratio is still kept and still reported; it is what
+ * `stalled_out` is judged on, because that is a verdict on the whole run.
+ */
+export const TRAILING_STALL_WINDOW_S = 60;
+
 export type ViewerOutcome =
   | 'running'
   | 'completed'
@@ -56,7 +75,20 @@ export interface ViewerRecord {
   stalls: number;
   stalledS: number;
   longestStallS?: number | undefined;
+  /** Lifetime `stalledS / mediaS`. A verdict on the whole run. */
   stallRatio?: number | undefined;
+  /** `stalledS / mediaS` over the last `TRAILING_STALL_WINDOW_S` of media. */
+  trailingStallRatio?: number | undefined;
+  /** Media seconds the trailing ratio was computed over. */
+  trailingMediaS?: number | undefined;
+  /**
+   * The viewer has fetched media but never filled its first buffer, so the
+   * playhead never started. Not a stalling viewer — a viewer that never
+   * watched anything, which a stall ratio of zero would otherwise flatter.
+   */
+  stuckPrerolling?: boolean | undefined;
+  /** Seconds spent filling the first buffer. Absent if it never finished. */
+  prerollS?: number | undefined;
   fetchMs: Distribution;
   /** fetch_ms / (segment_s * 1000). Above 1 the viewer is losing buffer. */
   realtimeFactor: Distribution;
@@ -108,6 +140,12 @@ export class ViewerRollup {
   private readonly realtimeSamples: number[] = [];
   private readonly stallSamples: number[] = [];
   private readonly bufferedSamples: number[] = [];
+  /** The trailing window: recent segments, oldest first, and its running sums. */
+  private readonly window: { mediaS: number; stallS: number }[] = [];
+  private windowMediaS = 0;
+  private windowStallS = 0;
+  /** The playhead has started at least once. */
+  private started = false;
   private readonly record: ViewerRecord;
 
   constructor(identity: ViewerIdentity) {
@@ -215,11 +253,18 @@ export class ViewerRollup {
         this.fetchSamples.push(fetchMs);
         this.realtimeSamples.push(fetchMs / (segmentS * 1000));
         this.bufferedSamples.push(event.buffered_s as number);
+        const stallS = event.stalled === true ? ((event.stall_s as number) ?? 0) : 0;
         if (event.stalled === true) {
           this.record.stalls += 1;
-          const stallS = (event.stall_s as number) ?? 0;
           this.record.stalledS += stallS;
           this.stallSamples.push(stallS);
+        }
+        this.pushWindow(segmentS, stallS);
+        // Absent means playing: that is what viewers built before pre-roll was
+        // separated from stalling reported, and their data must not change
+        // meaning under a newer runner.
+        if (event.playing !== false) {
+          this.started = true;
         }
         if (typeof event.peers === 'number') {
           this.record.peersLast = event.peers;
@@ -288,10 +333,36 @@ export class ViewerRollup {
         if (typeof event.peak_rss === 'number') {
           this.record.peakRssBytes = Math.max(this.record.peakRssBytes ?? 0, event.peak_rss);
         }
+        if (typeof event.preroll_s === 'number') {
+          this.record.prerollS = event.preroll_s;
+          this.started = true;
+        }
         break;
       }
       default:
         break;
+    }
+  }
+
+  /**
+   * Slide the trailing window forward by one segment.
+   *
+   * Trimmed by media seconds rather than by segment count, so a stream with
+   * 10 s segments and one with 2 s segments are judged over the same amount of
+   * playback. One segment always survives: a viewer that has produced any
+   * media at all has a ratio.
+   */
+  private pushWindow(mediaS: number, stallS: number): void {
+    this.window.push({ mediaS, stallS });
+    this.windowMediaS += mediaS;
+    this.windowStallS += stallS;
+    while (
+      this.window.length > 1 &&
+      this.windowMediaS - (this.window[0] as { mediaS: number }).mediaS >= TRAILING_STALL_WINDOW_S
+    ) {
+      const dropped = this.window.shift() as { mediaS: number; stallS: number };
+      this.windowMediaS -= dropped.mediaS;
+      this.windowStallS -= dropped.stallS;
     }
   }
 
@@ -308,6 +379,10 @@ export class ViewerRollup {
     record.longestStallS = max(this.stallSamples);
     record.minBufferedS = min(this.bufferedSamples);
     record.stallRatio = record.mediaS > 0 ? record.stalledS / record.mediaS : undefined;
+    record.trailingMediaS = this.windowMediaS > 0 ? this.windowMediaS : undefined;
+    record.trailingStallRatio =
+      this.windowMediaS > 0 ? this.windowStallS / this.windowMediaS : undefined;
+    record.stuckPrerolling = record.mediaS > 0 && !this.started;
     record.errors = [...this.record.errors];
     record.outcome = classify(record);
     return record;

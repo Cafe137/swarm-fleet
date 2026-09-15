@@ -93,6 +93,12 @@ export const SegmentEvent = z
     stalled: z.boolean().default(false),
     /** Seconds the playhead was dry before this segment landed. */
     stall_s: z.number().nonnegative().default(0),
+    /**
+     * False while the viewer is still filling its first buffer.
+     * Absent from viewers built before pre-roll was separated from stalling,
+     * and absent means playing — that is what those builds reported.
+     */
+    playing: z.boolean().optional(),
     feed_index: z.number().int().nonnegative().optional(),
     attempts: z.number().int().positive().default(1),
     peers: z.number().int().nonnegative().optional(),
@@ -161,6 +167,12 @@ export const SummaryEvent = z
     feed_index: z.number().int().nonnegative().optional(),
     finalized: z.boolean().default(false),
     peak_rss: z.number().int().nonnegative().optional(),
+    /**
+     * Seconds spent filling the first buffer before playback began. Absent
+     * when the viewer never got that far, which is a viewer that never
+     * watched anything rather than one that watched badly.
+     */
+    preroll_s: z.number().nonnegative().optional(),
   })
   .passthrough();
 

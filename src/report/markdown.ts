@@ -1,5 +1,6 @@
 /** `report.md`: the human read of a run. */
 
+import { TRAILING_STALL_WINDOW_S } from '../viewer/rollup.js';
 import type { RunSummary } from './summary.js';
 
 export function renderReport(summary: RunSummary): string {
@@ -43,9 +44,15 @@ export function renderReport(summary: RunSummary): string {
   lines.push('');
   lines.push('| | |');
   lines.push('| --- | --- |');
-  lines.push(`| Viewers degraded | **${percent(kpis.degradedFraction)}** (${kpis.degradedViewers} of ${kpis.viewers.started}) |`);
+  lines.push(`| Viewers degraded | **${percent(kpis.degradedFraction)}** (${kpis.degradedViewers} of ${kpis.viewers.started}), over the last ${TRAILING_STALL_WINDOW_S}s of media |`);
+  lines.push(`| Viewers degraded, whole run | ${percent(kpis.degradedFractionLifetime)} |`);
   lines.push(`| Stall ratio p50 / p95 | ${percent(kpis.stallRatio.p50)} / ${percent(kpis.stallRatio.p95)} |`);
   lines.push(`| Entirely stall-free | ${percent(kpis.stallFreeFraction)} |`);
+  if (kpis.stuckPrerolling > 0) {
+    lines.push(
+      `| Never filled a buffer | **${kpis.stuckPrerolling}** — fetched media but never started playing |`,
+    );
+  }
   lines.push(`| Join success | ${percent(kpis.joinSuccessRate)} |`);
   lines.push(`| Join latency p95 | ${millis(kpis.joinMs.p95)} |`);
   lines.push(`| Realtime factor p95 | ${fixed(kpis.realtimeFactorP95, 2)} ${realtimeNote(kpis.realtimeFactorP95)} |`);

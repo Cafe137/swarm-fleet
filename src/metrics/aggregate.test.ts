@@ -108,6 +108,62 @@ test('distinct content ratio separates popularity from capacity', () => {
   assert.equal(allDifferent.distinctContentRatio, 1);
 });
 
+test('the headline follows the trailing window, and the lifetime figure is kept', () => {
+  // Every viewer stalled once early and has been clean for the last minute.
+  // That is the shape of a cohort joining a live edge, and reporting it as
+  // 100% degraded is what made a healthy hand-driven run look like a failure.
+  const records = Array.from({ length: 10 }, (_, index) =>
+    record({
+      viewerId: `host-000${index}`,
+      stalls: 1,
+      stalledS: 1.5,
+      stallRatio: 0.015,
+      trailingStallRatio: 0,
+      trailingMediaS: 60,
+    }),
+  );
+  const kpis = cohortKpis(records, 10, 100);
+
+  assert.equal(kpis.degradedFraction, 0);
+  assert.equal(kpis.degradedFractionLifetime, 1);
+  assert.equal(kpis.trailingStallRatio.p95, 0);
+  // The stalls themselves are never hidden, whichever window is in front.
+  assert.equal(kpis.stallsTotal, 10);
+});
+
+test('a viewer struggling right now is degraded however clean its history', () => {
+  const records = [
+    record({ stallRatio: 0.001, trailingStallRatio: 0.2, trailingMediaS: 60 }),
+    record({ viewerId: 'host-0001', trailingStallRatio: 0, trailingMediaS: 60 }),
+  ];
+  const kpis = cohortKpis(records, 2, 100);
+  assert.equal(kpis.degradedViewers, 1);
+  assert.equal(kpis.degradedFraction, 0.5);
+  assert.equal(kpis.degradedFractionLifetime, 0);
+});
+
+test('a viewer with a summary but no segment events keeps its lifetime ratio', () => {
+  // Nothing to build a window from, so dropping it would shrink the
+  // denominator and flatter the run.
+  const kpis = cohortKpis([record({ stallRatio: 0.5, stalledS: 50 })], 1, 100);
+  assert.equal(kpis.degradedFraction, 1);
+  assert.equal(kpis.degradedViewers, 1);
+});
+
+test('a viewer stuck filling its buffer is degraded by definition', () => {
+  const kpis = cohortKpis(
+    [
+      record({ mediaS: 4, segments: 2, stallRatio: 0, trailingStallRatio: 0, stuckPrerolling: true }),
+      record({ viewerId: 'host-0001', trailingStallRatio: 0, trailingMediaS: 60 }),
+    ],
+    2,
+    100,
+  );
+  assert.equal(kpis.stuckPrerolling, 1);
+  assert.equal(kpis.degradedViewers, 1);
+  assert.equal(kpis.degradedFraction, 0.5);
+});
+
 test('a cohort with nothing watched yet reports no data, not zero', () => {
   const kpis = cohortKpis([record({ segments: 0, mediaS: 0, stallRatio: undefined })], 1, 10);
   assert.equal(kpis.degradedFraction, undefined);
