@@ -29,6 +29,8 @@ export interface CohortKpis {
   degradedViewers: number;
   stallRatio: Distribution;
   stallFreeFraction?: number | undefined;
+  /** Stall events across the fleet. A count, where the ratios are shares. */
+  stallsTotal: number;
   joinSuccessRate?: number | undefined;
   joinMs: Distribution;
   /** Above 1 at p95 means the tail of the fleet is losing buffer. */
@@ -114,6 +116,7 @@ export function cohortKpis(
     degradedFraction: withMedia.length > 0 ? degradedViewers / withMedia.length : undefined,
     degradedViewers,
     stallRatio: distribution(stallRatios),
+    stallsTotal: sum(records.map((record) => record.stalls)),
     stallFreeFraction:
       withMedia.length > 0
         ? stallRatios.filter((ratio) => ratio === 0).length / withMedia.length

@@ -24,10 +24,11 @@
  */
 
 import { execFile } from 'node:child_process';
-import { chmod, mkdtemp, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { sha256File } from './deploy.js';
+import { artifactFor, assetFor, type ViewerPlatform } from './platform.js';
 
 export const DEFAULT_REPO = 'Cafe137/weeb-3-rs-hls';
 export const DEFAULT_WORKFLOW = 'build.yml';
@@ -111,6 +112,95 @@ export async function fetchViewerBinary(
   return { path: binary, sha256, origin, ...(commit === undefined ? {} : { commit }) };
 }
 
+/** Where a participant's machine keeps viewer binaries between runs. */
+export function defaultCacheRoot(): string {
+  const base =
+    process.platform === 'win32'
+      ? (process.env['LOCALAPPDATA'] ?? path.join(os.homedir(), 'AppData', 'Local'))
+      : (process.env['XDG_CACHE_HOME'] ?? path.join(os.homedir(), '.cache'));
+  return path.join(base, 'swarm-loadtest', 'viewer');
+}
+
+export interface PlatformBinaryRequest {
+  platform: ViewerPlatform;
+  repo?: string | undefined;
+  /** A release tag; the newest release when absent. */
+  tag?: string | undefined;
+  cacheRoot?: string | undefined;
+}
+
+/**
+ * The viewer for one platform, downloaded once and then reused.
+ *
+ * This is the participant path, and it is deliberately not
+ * `fetchViewerBinary`. That one exists to put *one* trustworthy build on rented
+ * machines and will reach for `gh` to pin a commit; this one runs on a
+ * an ordinary desktop machine, where there is no `gh`, nobody is logged in, and the
+ * machine may well be on a hotel network. So: release assets only, no token, and
+ * a cache keyed by the release's own commit, so starting the tool a second time
+ * costs one small API call rather than 8 MB.
+ *
+ * The cache key is the commit rather than the tag because `nightly` is a
+ * rolling tag: keying on the tag alone would pin every participant to whatever
+ * they downloaded first, which is exactly the "everyone ran a different build"
+ * failure the release exists to prevent.
+ */
+export async function fetchViewerBinaryForPlatform(
+  request: PlatformBinaryRequest,
+  log: (level: 'info' | 'warn', message: string) => void = () => undefined,
+): Promise<FetchedBinary> {
+  const repo = request.repo ?? DEFAULT_REPO;
+  const artifact = artifactFor(request.platform);
+  const asset = assetFor(request.platform);
+  const release = await releaseFor(repo, request.tag);
+  const root = request.cacheRoot ?? defaultCacheRoot();
+  const dir = path.join(root, repo.replace(/[^\w.-]+/g, '-'), `${release.tag}-${release.commitish.slice(0, 12)}`);
+  const destination = path.join(dir, asset);
+  const origin = `${repo} release ${release.tag} (${release.commitish.slice(0, 12)})`;
+
+  const cached = await stat(destination).catch(() => undefined);
+  if (cached?.isFile() === true && cached.size > 0) {
+    const sha256 = await sha256File(destination);
+    log('info', `using the cached ${asset} from ${origin}`);
+    return { path: destination, sha256, origin: `${origin}, cached`, commit: release.commitish };
+  }
+
+  await mkdir(dir, { recursive: true });
+  const staging = await mkdtemp(path.join(dir, '.download-'));
+  try {
+    try {
+      await downloadAssets(release.assets, artifact, staging);
+    } catch (error) {
+      // The likeliest cause on a participant's machine is not a broken
+      // download but a release that does not carry this platform yet, and the
+      // person reading it can do nothing about that except ask for one.
+      throw new Error(
+        `there is no ${request.platform} viewer in ${repo} release ${release.tag}. ` +
+          'A build for this platform is needed before it can take part. ' +
+          `(${error instanceof Error ? error.message : String(error)})`,
+      );
+    }
+    const binary = await findBinary(staging, artifact);
+    const sha256 = await sha256File(binary);
+    await verifySidecar(staging, sha256, log);
+    await chmod(binary, 0o755);
+    // Renamed into place only once it has been verified, so an interrupted
+    // download can never be picked up as a cache hit next time.
+    await rename(binary, destination).catch(async (error: unknown) => {
+      // Another copy of the tool may have won the race and written the same
+      // bytes; that is a cache hit, not a failure.
+      const landed = await stat(destination).catch(() => undefined);
+      if (landed?.isFile() !== true) {
+        throw error;
+      }
+    });
+    log('info', `fetched ${asset} from ${origin} (${sha256.slice(0, 12)}\u2026)`);
+    return { path: destination, sha256, origin, commit: release.commitish };
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+}
+
 interface WorkflowRun {
   databaseId: string;
   headSha: string;
@@ -174,9 +264,17 @@ async function listRuns(repo: string, filters: readonly string[]): Promise<Workf
  */
 async function findBinary(dir: string, artifact: string): Promise<string> {
   const files = await filesUnder(dir);
-  const named = files.find(
-    (file) => path.basename(file) === BINARY_NAME || path.basename(file) === artifact,
-  );
+  const named = files.find((file) => {
+    const base = path.basename(file);
+    // Windows will not execute a file without the suffix, so CI publishes the
+    // asset with it while the artifact is still named without one.
+    return (
+      base === BINARY_NAME ||
+      base === `${BINARY_NAME}.exe` ||
+      base === artifact ||
+      base === `${artifact}.exe`
+    );
+  });
   if (named !== undefined) {
     return named;
   }

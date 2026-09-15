@@ -146,6 +146,17 @@ export const Configure = z.object({
   sampleIntervalMs: z.number().positive(),
   countSockets: z.boolean().default(false),
   maxViewers: z.number().int().nonnegative(),
+  /**
+   * Viewers to size preflight against, when that differs from the launch cap.
+   *
+   * A session's cap is "as far as this machine goes" and judging descriptors,
+   * memory and ports against it would produce a page of failures about a
+   * thousand viewers nobody is starting. What is worth checking is the cohort
+   * that is about to start.
+   */
+  sizeViewers: z.number().int().nonnegative().optional(),
+  /** `participant` makes every preflight check advisory. See `preflight.ts`. */
+  profile: z.enum(['rig', 'participant']).default('rig'),
 });
 
 /**
@@ -162,6 +173,16 @@ export const SetTarget = z.object({
   kind: z.literal('set_target'),
   concurrent: z.number().int().nonnegative(),
   totalStarts: z.number().int().nonnegative(),
+  /**
+   * How long a viewer gets to finish when the target comes *down*.
+   *
+   * A target that falls is a scale-down, not an end of run: in a session a
+   * participant presses the left arrow and twenty viewers have to go. They are
+   * stopped the same way the end of a run stops them — SIGTERM, then SIGKILL —
+   * so each one still emits its summary and its share of the media it played is
+   * not silently lost from the totals.
+   */
+  graceMs: z.number().nonnegative().default(10_000),
 });
 /**
  * Open the barrier on every viewer this agent holds, and on every one it starts

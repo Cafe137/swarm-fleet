@@ -55,12 +55,16 @@ async function runScenario(overrides: Partial<Scenario>): Promise<{
 }
 
 test('a cohort runs, reports, and leaves a readable run directory', async () => {
-  const { result, dir } = await runScenario({ viewers: 4 });
+  // Twelve segments rather than the usual six: this is the test that asserts
+  // resource sampling reached the report, and CPU utilisation is a difference
+  // between two ticks. At 250 ms a ~1 s run produces one or two ticks, so the
+  // assertion came down to whether the second one landed before the run ended.
+  const { result, dir } = await runScenario({ viewers: 4, segments: 12 });
 
   assert.equal(result.valid, true, result.invalidBecause.join('; '));
   assert.equal(result.kpis.viewers.started, 4);
   assert.equal(result.kpis.viewers.byOutcome.completed, 4);
-  assert.equal(result.kpis.segments, 24);
+  assert.equal(result.kpis.segments, 48);
   assert.ok(result.kpis.bytes > 0);
   assert.equal(result.kpis.joinSuccessRate, 1);
   assert.equal(result.kpis.degradedFraction, 0);

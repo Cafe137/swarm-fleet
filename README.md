@@ -4,8 +4,9 @@ Publishes a live stream over Swarm, launches many `weeb-3-rs-hls` viewers — ac
 machines — and turns what they report into KPIs about how Swarm behaves under viewer
 load. Stalling first, and a dozen other things that turn out to matter.
 
-One project, four commands: `publish` a stream, `deploy` the viewer, `run` the fleet,
-`report` on it.
+One project, five commands: `publish` a stream, `deploy` the viewer, `run` the fleet,
+`report` on it — and `join`, which drives viewers from an operator's own machine by hand
+rather than from a scripted plan.
 
 The viewer is [`weeb-3-rs-hls`](https://github.com/Cafe137/weeb-3-rs-hls) — a native Swarm
 client that peers and watches a stream, and does nothing else. `--from-github` fetches the
@@ -33,6 +34,69 @@ npx tsx src/cli.ts run --mode cohort --viewers 20 --duration 300 \
 npx tsx src/cli.ts run --mode ramp --ramp-start 10 --ramp-step 10 --ramp-max 200 \
   --ramp-interval 120 --agent box-a --from-github --stream <owner>:<topic>
 ```
+
+## `join`: hand-driven viewers, from wherever they are
+
+Everything above rents machines and produces a defensible capacity number. `join` answers a
+different question: what Swarm does when the load comes from ordinary machines on ordinary
+connections, behind the NATs and routers a rented fleet never sees. Each machine runs one
+command and is scaled by hand; a backend tells them all what to watch and collects what they
+report.
+
+```sh
+npx tsx src/cli.ts join --server https://loadtest.example.org
+```
+
+That is the whole command. It asks the backend what to watch, downloads the viewer built for
+*this* machine, starts twenty of them, and draws a dashboard with two keys — right arrow adds
+twenty, left arrow removes twenty, `q` stops. Every fifteen seconds it posts its node count
+and throughput, and gets back the leaderboard it appears on.
+
+A participant never types any of that. The backend
+([`swarm-loadtest-backend`](https://github.com/Cafe137/swarm-loadtest-backend)) serves an
+installer with its own address already in it, so what gets handed out is two lines: one that
+installs (fetching a private Node if the machine has none) and writes a `swarm-loadtest`
+launcher, and then the launcher itself.
+
+```sh
+curl -fsSL https://loadtest.example.org/join | sh    # install
+swarm-loadtest                                       # run
+```
+
+**The split is load-bearing.** A script piped into `sh` has the pipe as its standard input,
+and so does anything it starts — a client launched from inside the installer cannot read a
+keystroke, so the arrow keys would do nothing while the dashboard advertised them. Run from
+the prompt, it owns the terminal.
+
+Four things behave differently under `join`, and all of them are deliberate:
+
+-   **`--mode session`.** No duration, no ramp, no end: the target is whatever the arrow keys
+    last said, viewers that end are replaced, and the session is over when the person says so.
+    Replacement works off a start budget that *slides* with what has already been started, so
+    an evening of scaling up and down, and viewers retiring after their hour, never runs it
+    out — while a viewer that crashes on startup is still bounded to a few retries a minute.
+-   **`--profile participant`.** Preflight becomes advisory. A machine somebody also uses for
+    other things is never idle and will never pass a rig's headroom checks, and refusing to run
+    there would cost the test viewers while protecting a measurement that was not going to be
+    published as capacity. Every check still runs, and the report says which machine it was.
+-   **About 80 nodes is the ceiling on any laptop**, and it is ephemeral ports rather than
+    memory or CPU: 200 peers per node against the 16,384 ports the BSDs hand out. Measured
+    limits on macOS 14 are `kern.maxfilesperproc` 61,440 and a shell soft limit of 1,048,576,
+    so descriptors are not what runs out there. Lifting the port range needs `sudo`; the left
+    arrow does not.
+-   **The descriptor limit is raised first.** One viewer needs a little over 200 descriptors
+    and a macOS terminal has historically offered 256 in total, so the process re-executes
+    itself under a shell that raises the limit before anything else happens. Getting this wrong
+    does not look like a limit; it looks like Swarm being broken.
+
+Try it without Swarm using the mock viewer, against a backend running locally:
+
+```sh
+npx tsx src/cli.ts join --server http://127.0.0.1:8080 --binary mock
+```
+
+There is no participant token: the backend authenticates nobody, and is meant to sit on a
+private network or behind a proxy. See its README.
 
 Exit codes: **0** the run is valid, **4** the run is *invalid* — a guard KPI breached, so
 the numbers describe the load generator rather than Swarm — **1** it failed to start,

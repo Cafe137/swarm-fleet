@@ -113,6 +113,7 @@ export class FleetAgent {
       case 'set_target':
         this.target = message.concurrent;
         this.totalStarts = message.totalStarts;
+        this.shed(message.graceMs);
         this.pokeLauncher(0);
         this.reportState();
         break;
@@ -149,9 +150,10 @@ export class FleetAgent {
 
     const report = await preflight({
       machine,
-      maxViewers: message.maxViewers,
+      maxViewers: message.sizeViewers ?? message.maxViewers,
       peerLimit: message.spec.peerLimit ?? 200,
       binary: message.spec.binary,
+      profile: message.profile,
     });
     this.channel.send({ kind: 'ready', agent: this.name, preflight: report });
 
@@ -209,6 +211,35 @@ export class FleetAgent {
     gate.noteStart(now);
     // One per pass, so the minimum interval is actually applied.
     this.pokeLauncher(LAUNCH_POLL_MS);
+  }
+
+  /**
+   * Stop viewers this machine is no longer asked to hold.
+   *
+   * Newest first, and that is the whole of the policy. The oldest viewers have
+   * the most peers, the longest history and the steadiest numbers; throwing
+   * those away and keeping the ones that are still dialing would make a
+   * scale-down look like a collapse. Newest-first also undoes the most recent
+   * scale-up exactly, which is what someone pressing the left arrow means.
+   *
+   * A viewer already stopping is not counted again — `handle.stop` is
+   * idempotent, but the count of what is left has to be, too.
+   */
+  private shed(graceMs: number): void {
+    if (this.stopping) {
+      return;
+    }
+    const wanted = Math.min(this.target, this.maxViewers);
+    const live = [...this.viewers.values()].filter((viewer) => !viewer.handle.requested);
+    const excess = live.length - wanted;
+    if (excess <= 0) {
+      return;
+    }
+    const doomed = live.sort((left, right) => right.startedAtMs - left.startedAtMs).slice(0, excess);
+    for (const viewer of doomed) {
+      viewer.handle.stop(graceMs);
+    }
+    this.log('info', `stopping ${doomed.length} viewer(s) to reach a target of ${wanted}`);
   }
 
   private launchOne(spec: ViewerSpec, nowMs: number): void {

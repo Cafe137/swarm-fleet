@@ -54,6 +54,8 @@ export interface AgentReport {
   host: string;
   weight: number;
   maxViewers: number;
+  /** Viewers preflight was sized against, when that is not `maxViewers`. */
+  sizeViewers: number;
   machine?: MachineInfo | undefined;
   preflight?: PreflightReport | undefined;
   clockOffsetMs?: number | undefined;
@@ -95,6 +97,9 @@ export interface LiveSnapshot {
   windowMbps: number;
   segments: number;
   bytes: number;
+  /** Stall events so far, and peers held right now. Both for the human, live. */
+  stalls: number;
+  peersHeld: number;
   guardsOk: boolean;
   agents: AgentSnapshot[];
 }
@@ -243,7 +248,9 @@ export class Controller {
 
     this.startTicking();
     try {
-      if (this.scenario.ramp === undefined) {
+      if (this.scenario.mode === 'session') {
+        await this.driveSession();
+      } else if (this.scenario.ramp === undefined) {
         await this.driveFixed();
       } else {
         await this.driveRamp();
@@ -261,10 +268,12 @@ export class Controller {
   // -------------------------------------------------------------- connect
 
   private async connect(): Promise<void> {
-    const shares = partition(
-      this.scenario.peakViewers,
-      this.scenario.agents.map((agent) => agent.weight),
-    );
+    const weights = this.scenario.agents.map((agent) => agent.weight);
+    // Two partitions, because a session's ceiling and its opening cohort are
+    // different numbers: the first caps what an agent will ever launch, the
+    // second is what preflight judges the machine against.
+    const shares = partition(this.scenario.viewerCeiling, weights);
+    const startShares = partition(this.scenario.peakViewers, weights);
 
     this.scenario.agents.forEach((target, index) => {
       const name = target.name ?? (target.host === 'local' ? 'local' : target.host);
@@ -274,6 +283,7 @@ export class Controller {
         host: target.host,
         weight: target.weight,
         maxViewers: cap,
+        sizeViewers: Math.min(cap, startShares[index] as number),
         samples: [],
         startTimestamps: [],
         guards: [],
@@ -438,6 +448,8 @@ export class Controller {
         sampleIntervalMs: this.scenario.sampleIntervalMs,
         countSockets: this.scenario.countSockets,
         maxViewers: link.report.maxViewers,
+        sizeViewers: link.report.sizeViewers,
+        profile: this.scenario.profile,
       });
     }
   }
@@ -483,14 +495,25 @@ export class Controller {
   /**
    * How many viewers each agent should hold, and how many it may ever start.
    *
-   * `replacements` is the difference. A cohort wants none: its viewers are
-   * bounded by `--segments` or `--duration`, they finish, and replacing them
-   * would turn a 6-viewer run into an endless one. A ramp wants a few, so that
-   * a viewer lost to a crash does not silently lower the concurrency the run
-   * believes it is testing — but bounded, because an unbounded replacement
-   * policy against a binary that crashes on startup forks the machine to death.
+   * `replacements` is the difference, and all three answers are a start budget
+   * — one number the agent counts down — rather than three mechanisms:
+   *
+   * -   **`none`**, a cohort: its viewers are bounded by `--segments` or
+   *     `--duration`, they finish, and replacing them would turn a 6-viewer run
+   *     into an endless one.
+   * -   **`bounded`**, a ramp: a few spare starts, so a viewer lost to a crash
+   *     does not silently lower the concurrency the run believes it is testing,
+   *     but not so many that a binary which crashes on startup forks the
+   *     machine to death.
+   * -   **`live`**, a session: the budget *slides*. It is set from what this
+   *     agent has already started rather than accumulated with `Math.max`, so
+   *     re-issuing the same target — which `driveSession` does every 30 s —
+   *     genuinely tops it up. That is what makes a session able to replace
+   *     viewers that retire after an hour, and to be scaled down and back up
+   *     all evening, while still bounding a crash loop to `share + 5` starts
+   *     per re-issue rather than thousands a second.
    */
-  private setTotalTarget(total: number, replacements: 'none' | 'bounded'): void {
+  private setTotalTarget(total: number, replacements: 'none' | 'bounded' | 'live'): void {
     this.requested = Math.max(this.requested, total);
     const shares = partition(total, this.links.map((link) => link.report.weight));
     this.links.forEach((link, index) => {
@@ -498,13 +521,95 @@ export class Controller {
       const totalStarts =
         replacements === 'none' ? share : share + Math.ceil(share * 0.25) + 5;
       link.target = share;
-      link.totalStarts = Math.max(link.totalStarts, totalStarts);
+      link.totalStarts =
+        replacements === 'live'
+          ? link.started + share + 5
+          : Math.max(link.totalStarts, totalStarts);
       link.channel.send({
         kind: 'set_target',
         concurrent: share,
         totalStarts: link.totalStarts,
+        graceMs: this.scenario.graceMs,
       });
     });
+  }
+
+  // ---------------------------------------------------------------- session
+
+  /**
+   * The target a session is holding, and the only number the keyboard changes.
+   *
+   * Kept apart from `requested`, which is a high-water mark used for sizing:
+   * a session that went to 60 and back to 20 asked for 60 once and is holding
+   * 20 now, and both facts matter.
+   */
+  private sessionTarget = 0;
+
+  /** The most viewers any one agent will accept, summed. */
+  capacity(): number {
+    return this.links.reduce((sum, link) => sum + link.report.maxViewers, 0);
+  }
+
+  /** What the session is holding right now. */
+  target(): number {
+    return this.sessionTarget;
+  }
+
+  /**
+   * Ask for a different number of viewers, right now.
+   *
+   * Public, and the only public way to change a run's shape while it is
+   * running. A session driver calls it from a keypress; nothing else does.
+   * Clamped rather than validated: a participant leaning on the right arrow
+   * should reach the machine's ceiling and stop there, not be told off.
+   */
+  setViewerTarget(total: number): number {
+    const wanted = Math.max(0, Math.min(Math.round(total), this.capacity()));
+    if (wanted === this.sessionTarget) {
+      return wanted;
+    }
+    this.sessionTarget = wanted;
+    this.setTotalTarget(wanted, 'live');
+    this.recordRampStep(wanted);
+    return wanted;
+  }
+
+  /**
+   * Hold whatever target the keyboard last asked for, until someone stops it.
+   *
+   * There is no completion condition here on purpose. A cohort ends when its
+   * viewers finish and a ramp ends when it breaches; a session ends when the
+   * person running it says so, or when the run ceiling catches a terminal
+   * somebody walked away from. Viewers that end on their own are replaced,
+   * because a session is defined by how many viewers are up rather than by how
+   * many were started.
+   */
+  private async driveSession(): Promise<void> {
+    this.setViewerTarget(this.scenario.raw.viewers ?? this.scenario.peakViewers);
+
+    const ceilingMs = this.startedAtMs + this.scenario.maxRunS * 1_000;
+    const TOP_UP_MS = 30_000;
+    let nextTopUpMs = Date.now() + TOP_UP_MS;
+    // Polled rather than slept through: someone pressing `q` must be answered
+    // now, not at the end of a housekeeping interval.
+    while (!this.aborted && Date.now() < ceilingMs) {
+      await sleep(200);
+      if (this.aborted || Date.now() < nextTopUpMs) {
+        continue;
+      }
+      nextTopUpMs = Date.now() + TOP_UP_MS;
+      // Re-issuing the same target slides the start budget forward from what
+      // has already been started (see `setTotalTarget`), which is what lets a
+      // session replace the viewers it retires after an hour. Doing it on a
+      // timer rather than continuously is also the crash-loop bound: a binary
+      // that dies on startup costs `share + 5` starts every 30 s, not
+      // thousands a second.
+      this.setTotalTarget(this.sessionTarget, 'live');
+    }
+
+    this.stoppedBecause = this.aborted
+      ? 'the session was stopped'
+      : `hit the ${this.scenario.maxRunS}s run ceiling`;
   }
 
   private async driveFixed(): Promise<void> {
@@ -795,22 +900,25 @@ export class Controller {
 
   private async collectAll(): Promise<void> {
     this.closeViewerLogs();
+    // Only a remote agent has files to ship: a local one writes its viewer logs
+    // straight into this run's directory.
     const remote = this.links.filter((link) => link.report.host !== 'local');
-    if (remote.length === 0) {
-      for (const link of this.links) {
-        link.collectDone = true;
+    if (remote.length > 0) {
+      await mkdir(path.join(this.runDir, 'viewers'), { recursive: true });
+      for (const link of remote) {
+        link.channel.send({ kind: 'collect' });
       }
-      return;
+      await this.waitFor(
+        () => remote.every((link) => link.collectDone),
+        COLLECT_TIMEOUT_MS,
+        undefined,
+      );
     }
-    await mkdir(path.join(this.runDir, 'viewers'), { recursive: true });
-    for (const link of remote) {
-      link.channel.send({ kind: 'collect' });
-    }
-    await this.waitFor(
-      () => remote.every((link) => link.collectDone),
-      COLLECT_TIMEOUT_MS,
-      undefined,
-    );
+    // Every agent is shut down, local ones included. An in-process agent that is
+    // never told to shut down keeps its 1 Hz sampler running for the life of the
+    // process — invisible in a one-run CLI that exits straight after, and a leak
+    // in a session, where each restart leaves another ghost forking `ps` once a
+    // second and appending to a finished run's machine log.
     for (const link of this.links) {
       link.collectDone = true;
       link.channel.send({ kind: 'shutdown' });
@@ -1098,7 +1206,12 @@ export class Controller {
         // `port-ceiling` and `flood` exist to find the point where viewers stop
         // getting peers, so there the shortfall is the answer, not a fault.
         peerTargetAdvisory:
-          this.scenario.mode === 'port-ceiling' || this.scenario.mode === 'flood',
+          this.scenario.mode === 'port-ceiling' ||
+          this.scenario.mode === 'flood' ||
+          // A session is a person pushing their own machine until it complains.
+          // Viewers that cannot hold their peers are the complaint, and reading
+          // it as a broken rig would invalidate every run that found a limit.
+          this.scenario.mode === 'session',
         // Only set for a settled run: elsewhere it equals the run's start and
         // scopes nothing.
         ...(this.scenario.settle === undefined ? {} : { measuredFromMs: this.measuredFromMs }),
@@ -1160,6 +1273,8 @@ export class Controller {
         windowMbps: this.throughput.mbps(Date.now()),
         segments: kpis.segments,
         bytes: kpis.bytes,
+        stalls: kpis.stallsTotal,
+        peersHeld: kpis.peersTotal,
         guardsOk,
         agents: this.links.map((link) => this.agentSnapshot(link)),
       });
@@ -1184,6 +1299,25 @@ export class Controller {
    * Something that makes a number here mean less than it appears to, but does
    * not make the run worthless. `invalid` is for the latter.
    */
+  /**
+   * A finding about the quality of the measurement.
+   *
+   * On a rig it invalidates the run: the whole point of the guards is that the
+   * generator's own limits must never be published as Swarm's. On a
+   * participant's laptop there is no such number to protect — the machine is
+   * someone's daily driver, it was never going to pass a headroom check, and
+   * the useful output is the load it put on the network, which happened
+   * regardless. So there the same finding is recorded as a caveat and the run
+   * still reports success.
+   */
+  private judge(reason: string): void {
+    if (this.scenario.profile === 'participant') {
+      this.caveat(reason);
+      return;
+    }
+    this.invalid(reason);
+  }
+
   private caveat(reason: string): void {
     if (!this.observedCaveats.includes(reason)) {
       this.observedCaveats.push(reason);
@@ -1238,7 +1372,7 @@ export class Controller {
     const kpis = cohortKpis(records, this.requested, (endedAtMs - this.measuredFromMs) / 1000);
     const guards = this.evaluateAllGuards();
     for (const guard of guards.filter((verdict) => verdict.status === 'breached')) {
-      this.invalid(`guard ${guard.name}: ${guard.detail}`);
+      this.judge(`guard ${guard.name}: ${guard.detail}`);
     }
     // Every agent is measured against this one controller, so agents that agree
     // on their offset are not the ones with the wrong clock.
@@ -1246,7 +1380,7 @@ export class Controller {
       .map((agent) => agent.clockOffsetMs)
       .filter((offset): offset is number => offset !== undefined);
     if (controllerClockSuspect(offsets)) {
-      this.invalid(
+      this.judge(
         `every agent reports the controller's clock as ${(-(offsets[0] as number)).toFixed(0)} ms ` +
           'out: fix NTP on the controller, not on the agents',
       );
@@ -1257,7 +1391,7 @@ export class Controller {
     const expectSamples = durationS > (this.scenario.sampleIntervalMs / 1000) * 3;
     for (const agent of this.agents()) {
       if (expectSamples && agent.samples.length === 0) {
-        this.invalid(
+        this.judge(
           `agent ${agent.name} produced no resource samples in ${durationS.toFixed(0)}s, ` +
             'so nothing guarded this run',
         );
@@ -1268,7 +1402,7 @@ export class Controller {
     // it reports.
     const crashed = kpis.viewers.byOutcome.crashed + kpis.viewers.byOutcome.never_joined;
     if (crashed > 0 && crashed > kpis.viewers.started * 0.05) {
-      this.invalid(
+      this.judge(
         `${crashed} of ${kpis.viewers.started} viewers crashed or never joined, so the ` +
           'fleet was smaller than the concurrency this run reports',
       );
@@ -1306,6 +1440,14 @@ export class Controller {
   private caveats(records: readonly ViewerRecord[], kpis: CohortKpis): string[] {
     // Scenario-level caveats first: they are true before the run starts.
     const caveats: string[] = [...this.scenario.caveats, ...this.observedCaveats];
+    if (this.scenario.profile === 'participant') {
+      caveats.push(
+        "ran on a participant's own machine, not on a rig: preflight was advisory and the " +
+          'guards below are recorded rather than enforced. This says how much load this ' +
+          'machine put on Swarm; it is not a capacity measurement, and its CPU, memory and ' +
+          'bandwidth figures describe a laptop that was also doing other things.',
+      );
+    }
     if (this.scenario.spec.binary === MOCK_BINARY) {
       caveats.push(
         'ran against the built-in mock viewer: this measures the rig, not Swarm.',
@@ -1371,7 +1513,14 @@ export class Controller {
    */
   async abort(reason: string): Promise<void> {
     this.aborted = true;
-    this.invalid(`aborted: ${reason}`);
+    if (this.scenario.mode === 'session') {
+      // A session has no other ending. Someone presses `q`, or Ctrl-C, and the
+      // run is over — that is the design, not an interrupted measurement, and
+      // marking it invalid would file every complete session as a failure.
+      this.caveat(`the session was ended by ${reason}`);
+    } else {
+      this.invalid(`aborted: ${reason}`);
+    }
     this.stoppedBecause = `aborted: ${reason}`;
     await this.stopAll();
   }

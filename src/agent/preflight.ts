@@ -49,7 +49,25 @@ export interface PreflightRequest {
   maxViewers: number;
   peerLimit: number;
   binary: string;
+  /**
+   * Who is asking, and therefore what a failed check means.
+   *
+   * `rig` is the default and the historical behaviour: this machine exists to
+   * produce a capacity number, so a check it fails is a reason to refuse — a
+   * measurement taken on a box that cannot support the load is worse than no
+   * measurement.
+   *
+   * `participant` is somebody's own machine, not a rig. It will never
+   * be idle, it may well be short of memory, and nobody is going to publish its
+   * numbers as Swarm's capacity. Refusing there would only mean one fewer
+   * viewer on the network, which is the opposite of the point. So every check
+   * still runs and is still reported — the dashboard shows them — but none of
+   * them is fatal.
+   */
+  profile?: PreflightProfile | undefined;
 }
+
+export type PreflightProfile = 'rig' | 'participant';
 
 export async function preflight(request: PreflightRequest): Promise<PreflightReport> {
   const { machine, maxViewers, peerLimit, binary } = request;
@@ -64,11 +82,22 @@ export async function preflight(request: PreflightRequest): Promise<PreflightRep
   const binaryCheck = await checkBinary(binary);
   checks.push(binaryCheck.check);
 
+  // The binary check is the one exception: with nothing to execute there is no
+  // run to have an opinion about, on any machine.
+  const advisory = request.profile === 'participant';
+  const judged = advisory
+    ? checks.map((check) =>
+        check.name === 'binary' || !check.fatal
+          ? check
+          : { ...check, fatal: false, detail: `${check.detail} (advisory: this is a participant's own machine)` },
+      )
+    : checks;
+
   const gitSha = binaryCheck.path === undefined ? undefined : await weeb3GitSha(binaryCheck.path);
 
   return {
-    ok: checks.every((check) => check.ok || !check.fatal),
-    checks,
+    ok: judged.every((check) => check.ok || !check.fatal),
+    checks: judged,
     ...(binaryCheck.sha256 === undefined ? {} : { binarySha256: binaryCheck.sha256 }),
     ...(binaryCheck.path === undefined ? {} : { binaryPath: binaryCheck.path }),
     ...(gitSha === undefined ? {} : { weeb3GitSha: gitSha }),
@@ -267,7 +296,14 @@ async function ephemeralPortRange(): Promise<{ first: number; last: number } | u
     : undefined;
 }
 
-async function fileDescriptorLimit(): Promise<number | undefined> {
+/**
+ * This process's soft descriptor limit, as a number.
+ *
+ * Exported because raising it is a separate job from reporting on it: a
+ * participant's laptop is re-exec'd under a raised limit before the run starts,
+ * and that decision needs the same reading preflight prints.
+ */
+export async function fileDescriptorLimit(): Promise<number | undefined> {
   const stdout = await run('/bin/sh', ['-c', 'ulimit -n']);
   if (stdout === undefined) {
     return undefined;

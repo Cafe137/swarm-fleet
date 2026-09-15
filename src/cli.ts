@@ -50,6 +50,7 @@ import {
 const USAGE = `usage: swarm-fleet <command> [options]
 
 commands:
+  join      take part in a load test: one command, arrow keys, no flags
   run       launch a fleet of viewers and report what happened
   agent     serve one machine's viewers over stdio (the controller starts this)
   mock      the built-in fake viewer, for developing the runner itself
@@ -59,6 +60,15 @@ commands:
   publish   put a live HLS stream on Swarm, for viewers to watch
   provision rent machines to run viewers on
   destroy   give them back
+
+join options:
+  --server <url>         the load-test backend  (default $SWARM_LOADTEST_SERVER)
+  --viewers <n>          override the number of nodes to start with
+  --binary <path>        a local viewer, instead of the one CI built
+  --github-repo <repo>   where the viewer is released  (default Cafe137/weeb-3-rs-hls)
+  --github-tag <tag>     which release to take the viewer from  (default newest)
+  --runs-dir <dir>       where session records go
+  --quiet                no dashboard, one line per report
 
 run options:
   --scenario <file>      JSON scenario; flags below override it
@@ -197,6 +207,8 @@ async function main(): Promise<number> {
   const args = new Args(argv.slice(1));
 
   switch (command) {
+    case 'join':
+      return joinLoadtest(args);
     case 'run':
       return runFleet(args);
     case 'agent':
@@ -218,6 +230,46 @@ async function main(): Promise<number> {
     default:
       process.stderr.write(USAGE);
       return 2;
+  }
+}
+
+// ------------------------------------------------------------------ join
+
+/**
+ * The participant's command.
+ *
+ * Everything is optional on purpose: the person running this installed it with
+ * one line and should not have to understand any of the flags above. The only
+ * thing it genuinely needs is the backend's address, and the launcher the
+ * installer wrote bakes that in.
+ */
+async function joinLoadtest(args: Args): Promise<number> {
+  const server = args.value('server') ?? process.env['SWARM_LOADTEST_SERVER'];
+  if (server === undefined || server === '') {
+    process.stderr.write(
+      'no backend to join: pass --server <url>, or set SWARM_LOADTEST_SERVER.\n' +
+        'The install command writes a launcher with the ' +
+        'address already in it.\n',
+    );
+    return 2;
+  }
+  const { runLoadtestSession } = await import('./loadtest/client.js');
+  try {
+    return await runLoadtestSession({
+      server,
+      ...defined({
+        binary: args.value('binary'),
+        githubRepo: args.value('github-repo'),
+        githubTag: args.value('github-tag'),
+        viewers: args.number('viewers'),
+        runsDir: args.value('runs-dir'),
+        maxSeconds: args.number('max-seconds'),
+      }),
+      quiet: args.has('quiet'),
+    });
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
   }
 }
 

@@ -8,7 +8,7 @@
  * to measure. See the cache note in CLAUDE.md.
  */
 
-import { type ChildProcess, spawn } from 'node:child_process';
+import { type ChildProcess, execFile, spawn } from 'node:child_process';
 import { createWriteStream, type WriteStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { StreamRef, ViewerSpec } from '../transport/protocol.js';
@@ -131,7 +131,13 @@ export function launchViewer(launch: ViewerLaunch, hooks: ViewerHooks): ViewerHa
     // Its own process group, so `stop` can take down anything the viewer
     // spawned and a killed controller cannot leave 200 mainnet connections
     // per viewer behind.
-    detached: true,
+    //
+    // Not on Windows, where `detached` means "give it its own console window"
+    // — a hundred viewers would be a hundred windows. There the group is taken
+    // down by `taskkill /T` instead, and `windowsHide` keeps the console the
+    // child does get from flashing on screen.
+    detached: process.platform !== 'win32',
+    windowsHide: true,
     // stdin is the release channel, and only a holding viewer reads it. Left
     // as a pipe for every viewer it would be an idle fd per process and an
     // EPIPE to explain; left as `ignore` for a holding one, the viewer sees
@@ -215,10 +221,26 @@ export function launchViewer(launch: ViewerLaunch, hooks: ViewerHooks): ViewerHa
   };
 }
 
-/** Signal the whole group, falling back to the process if the group is gone. */
+/**
+ * Signal the whole group, falling back to the process if the group is gone.
+ *
+ * Windows has no signals and no process groups to signal: `taskkill /T /F`
+ * terminates the process and its children, and nothing the viewer does can
+ * catch it. The cost is real and is recorded rather than worked around — a
+ * Windows viewer that is stopped loses its own summary line, so its last few
+ * seconds are missing from the per-viewer record. What it already reported is
+ * unaffected, which is why a participant's 15-second reports are the
+ * authoritative numbers of a hand-driven run and the summary is a bonus.
+ */
 export function signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   const pid = child.pid;
   if (pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  if (process.platform === 'win32') {
+    // SIGTERM would be a graceless kill of the one process, leaving anything it
+    // spawned behind; `/T` is the only way to take the tree.
+    execFile('taskkill.exe', ['/pid', String(pid), '/T', '/F'], () => undefined);
     return;
   }
   try {

@@ -84,7 +84,14 @@ export function parseMockArgs(argv: readonly string[]): MockArgs | undefined {
     owner: argv[1],
     topic: argv[2],
     live: argv.includes('--live'),
-    segments: numeric('--segments') ?? 8,
+    // `--duration` and `--segments` are alternatives and the duration wins, the
+    // same way it does in the real binary: the 8-segment default is a "prove it
+    // works" bound for a human at a terminal, and applying it under a duration
+    // silently turned a 60 s run into a 17 s one there. A mock that did not
+    // mirror that would end every session run after eight segments.
+    segments:
+      numeric('--segments') ??
+      (numeric('--duration') === undefined ? 8 : Number.MAX_SAFE_INTEGER),
     durationS: numeric('--duration'),
     peerLimit: numeric('--peers'),
     peerUp: numeric('--peer-up'),

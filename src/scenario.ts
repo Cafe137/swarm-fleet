@@ -88,7 +88,26 @@ export const SettleConfig = z.object({
 });
 export type SettleConfig = z.infer<typeof SettleConfig>;
 
-export const MODES = ['cohort', 'ramp', 'soak', 'flood', 'port-ceiling'] as const;
+/**
+ * `session` is the odd one out, and deliberately so.
+ *
+ * Every other mode describes a measurement that ends: a cohort watches for a
+ * duration, a ramp climbs until something breaks. A session ends when a human
+ * says so. It exists for a hand-driven run, where a participant starts
+ * twenty viewers, then scales up and down by hand while a call is going on, and
+ * the interesting number is what every machine generated together rather
+ * than what any one laptop did.
+ */
+/**
+ * The default ceiling for a hand-driven session.
+ *
+ * Far above what any laptop will manage — 1,000 viewers is ~35 GB of resident
+ * memory and 200,000 sockets — which is the intent: the limit a participant
+ * finds should be their machine's, not a number chosen here.
+ */
+export const SESSION_VIEWER_CEILING = 1_000;
+
+export const MODES = ['cohort', 'ramp', 'soak', 'flood', 'port-ceiling', 'session'] as const;
 export type Mode = (typeof MODES)[number];
 
 export const Scenario = z
@@ -154,6 +173,25 @@ export const Scenario = z
     stragglerGraceS: z.number().positive().optional(),
     /** `flood` refuses to run without this. */
     acknowledgeFlood: z.boolean().default(false),
+    /**
+     * How far a session may be scaled up by hand.
+     *
+     * Not a policy about what is sensible — a participant in a hand-driven run
+     * is *supposed* to push their machine until something gives, and finding
+     * that point is half the value. It is a bound on the arithmetic: the
+     * partition, the start budgets and the clamp all need a finite number, and
+     * a laptop runs out of memory long before a thousand viewers.
+     */
+    viewerCeiling: z.number().int().positive().optional(),
+    /**
+     * Whose machine this is, and therefore what preflight's refusals mean.
+     *
+     * `rig` is a machine rented to produce a capacity number. `participant` is
+     * a machine somebody uses for other things, where every check is
+     * advisory: refusing to run there costs the test viewers and protects a
+     * measurement nobody was going to publish. See `agent/preflight.ts`.
+     */
+    profile: z.enum(['rig', 'participant']).default('rig'),
     runsDir: z.string().default('runs'),
     env: z.record(z.string()).default({}),
     extraArgs: z.array(z.string()).default([]),
@@ -164,8 +202,17 @@ export type Scenario = z.infer<typeof Scenario>;
 export interface ResolvedScenario {
   mode: Mode;
   label: string;
-  /** Peak viewers this run will ever ask for. Sizes preflight. */
+  /** Viewers this run starts with, and what preflight is sized against. */
   peakViewers: number;
+  /**
+   * The most viewers this run may ever hold.
+   *
+   * The same as `peakViewers` everywhere except a session, where the target is
+   * a person's arrow keys rather than a plan, so the two genuinely differ:
+   * preflight should judge the twenty viewers about to start, and the clamp
+   * should let them reach whatever their machine can stand.
+   */
+  viewerCeiling: number;
   ramp: RampConfig | undefined;
   /** Set when the cohort peers and waits before it watches. */
   settle: (SettleConfig & { peerUp: number }) | undefined;
@@ -179,6 +226,7 @@ export interface ResolvedScenario {
   sampleIntervalMs: number;
   countSockets: boolean;
   graceMs: number;
+  profile: 'rig' | 'participant';
   runsDir: string;
   /** Set when this run publishes its own stream. */
   publisher: PublisherConfig | undefined;
@@ -255,7 +303,20 @@ export function resolveScenario(input: unknown): ResolvedScenario {
   // A ramp adds viewers on purpose while the run is measuring, so there is no
   // moment when the cohort is "all there" to release. Refusing is better than
   // quietly settling the first step and calling it a ramp.
+  if (scenario.mode === 'session' && scenario.ramp !== undefined) {
+    throw new Error(
+      'a session is driven by hand, so a ramp has nothing to drive: the target changes when ' +
+        'someone presses a key. Use --mode ramp for a scripted climb.',
+    );
+  }
+
   const settleRequested = scenario.settle !== undefined && scenario.settle !== false;
+  if (settleRequested && scenario.mode === 'session') {
+    throw new Error(
+      'settle and session are alternatives: settling releases a complete cohort at one instant, ' +
+        'and a session never has a complete cohort — that is what the arrow keys are for.',
+    );
+  }
   if (settleRequested && ramp !== undefined) {
     throw new Error(
       'settle and ramp are alternatives: a ramp deliberately starts viewers during the ' +
@@ -296,12 +357,20 @@ export function resolveScenario(input: unknown): ResolvedScenario {
   const settleS = settle === undefined ? 0 : settle.timeoutS;
   const maxRunS =
     scenario.maxRunS ??
-    (ramp === undefined ? (durationS ?? 600) + 300 + settleS : rampTotalS + 300);
+    (scenario.mode === 'session'
+      ? // Long enough that a session ends when someone ends it, short enough
+        // that a forgotten terminal does not hold mainnet connections all week.
+        12 * 3_600
+      : ramp === undefined
+        ? (durationS ?? 600) + 300 + settleS
+        : rampTotalS + 300);
 
   return {
     mode: scenario.mode,
     label: scenario.label ?? `${scenario.mode}-${peakViewers}`,
     peakViewers,
+    viewerCeiling:
+      scenario.viewerCeiling ?? (scenario.mode === 'session' ? SESSION_VIEWER_CEILING : peakViewers),
     ramp,
     settle,
     stop: StopCondition.parse(scenario.stop ?? {}),
@@ -321,6 +390,7 @@ export function resolveScenario(input: unknown): ResolvedScenario {
     agents: scenario.agents,
     sampleIntervalMs: scenario.sampleIntervalMs,
     countSockets: scenario.countSockets ?? scenario.mode === 'port-ceiling',
+    profile: scenario.profile,
     graceMs: scenario.graceMs,
     runsDir: scenario.runsDir,
     publisher,
@@ -340,6 +410,13 @@ function defaultDuration(mode: Mode): number {
       return 3_600;
     case 'flood':
       return 120;
+    // A session's viewers are replaced when they end, so this is not how long
+    // the session lasts — it is how long one viewer lives before it is retired
+    // and a fresh one takes its place. An hour is long enough that nobody sees
+    // it happen mid-run, and short enough that a viewer which has quietly
+    // stopped retrieving does not sit there for the whole event.
+    case 'session':
+      return 3_600;
     default:
       return 300;
   }

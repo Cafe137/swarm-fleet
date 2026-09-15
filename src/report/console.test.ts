@@ -37,6 +37,8 @@ function live(agents: AgentSnapshot[]): LiveSnapshot {
     stallRatioP95: 0.243,
     realtimeFactorP95: 0.81,
     windowMbps: 135,
+    stalls: 0,
+    peersHeld: 1_200,
     segments: 4523,
     bytes: 3055 * 1024 * 1024,
     guardsOk: false,

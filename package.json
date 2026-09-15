@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Publishes live HLS streams over Swarm and launches many weeb-3-rs-hls viewers across machines, turning what they report into KPIs.",
+  "description": "Publishes live HLS streams over Swarm, launches many weeb-3-rs-hls viewers across machines or on your own, and turns what they report into KPIs.",
   "engines": {
     "node": ">=20"
   },
@@ -12,6 +12,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "prepare": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test --test-concurrency=1 'src/**/*.test.ts'",
     "fleet": "tsx src/cli.ts"
@@ -26,5 +27,17 @@
     "@types/node": "^22.10.0",
     "tsx": "^4.19.4",
     "typescript": "^5.7.0"
-  }
+  },
+  "main": "./dist/cli.js",
+  "types": "./dist/cli.d.ts",
+  "exports": {
+    ".": "./dist/cli.js",
+    "./publisher/*": "./dist/publisher/*",
+    "./loadtest/*": "./dist/loadtest/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ]
 }

@@ -75,9 +75,50 @@ export function parsePsOutput(stdout: string): ProcessSample[] {
   return samples;
 }
 
+/**
+ * PowerShell's answer to `ps`: `<pid> <resident bytes> <cpu seconds>`.
+ *
+ * Bytes rather than KiB and a decimal number of seconds rather than a clock
+ * face, so it gets its own parser instead of contorting `parsePsOutput`. A pid
+ * that has already exited prints nothing, which is the same thing `ps` does.
+ */
+export function parsePowerShellProcesses(stdout: string): ProcessSample[] {
+  const samples: ProcessSample[] = [];
+  for (const line of stdout.split('\n')) {
+    const fields = line.trim().split(/\s+/);
+    if (fields.length < 3) {
+      continue;
+    }
+    const pid = Number(fields[0]);
+    const rssBytes = Number(fields[1]);
+    const cpuSeconds = Number(fields[2]);
+    if (!Number.isFinite(pid) || !Number.isFinite(rssBytes) || !Number.isFinite(cpuSeconds)) {
+      continue;
+    }
+    samples.push({ pid, rssBytes, cpuSeconds });
+  }
+  return samples;
+}
+
 export async function sampleProcesses(pids: readonly number[]): Promise<ProcessSample[]> {
   if (pids.length === 0) {
     return [];
+  }
+  if (process.platform === 'win32') {
+    // Fields are stringified one by one against the invariant culture, not
+    // formatted with `-f`: that operator uses the *current* culture, so on a
+    // German or French Windows the CPU seconds come out as `1,5`, every line
+    // fails to parse, and the machine reports no resource samples at all —
+    // which on a rig is a guard breach rather than a missing column.
+    const stdout = await powershell(
+      `Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | ` +
+        // Single quotes throughout, so nothing here depends on how Node
+        // escapes a double quote into a Windows command line.
+        "ForEach-Object { $_.Id.ToString([cultureinfo]::InvariantCulture) + ' ' + " +
+        "$_.WorkingSet64.ToString([cultureinfo]::InvariantCulture) + ' ' + " +
+        '$_.TotalProcessorTime.TotalSeconds.ToString([cultureinfo]::InvariantCulture) }',
+    );
+    return stdout === undefined ? [] : parsePowerShellProcesses(stdout);
   }
   const stdout = await run('ps', ['-o', 'pid=,rss=,time=', '-p', pids.join(',')]);
   return stdout === undefined ? [] : parsePsOutput(stdout);
@@ -90,6 +131,8 @@ export async function sampleProcesses(pids: readonly number[]): Promise<ProcessS
  * costs enough to perturb what it measures, so it is off by default.
  */
 export async function countEstablishedSockets(): Promise<number | undefined> {
+  // `netstat -an -p tcp` is spelled the same on darwin and on Windows, and
+  // prints ESTABLISHED on a line either way, so only Linux needs its own.
   const stdout =
     process.platform === 'linux'
       ? await run('ss', ['-tan', 'state', 'established'])
@@ -170,6 +213,19 @@ export class Ticker {
     }, delay);
     this.timer.unref();
   }
+}
+
+/**
+ * One PowerShell command, or `undefined`.
+ *
+ * Windows has no `ps`, no `/proc` and no `netstat -ib`, and the `wmic` that
+ * used to stand in for all three is gone from Windows 11. Every caller here
+ * already treats a missing reading as "not measured" — the live view renders it
+ * as `-` — so a machine with a locked-down PowerShell loses a column rather
+ * than the run.
+ */
+function powershell(script: string): Promise<string | undefined> {
+  return run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script]);
 }
 
 function run(command: string, args: readonly string[]): Promise<string | undefined> {
@@ -273,6 +329,39 @@ function isLoopback(name: string): boolean {
   return name === 'lo' || name.startsWith('lo0') || name.startsWith('lo:');
 }
 
+/**
+ * `Get-NetAdapterStatistics`, one `name|rx|tx` per adapter.
+ *
+ * The cmdlet does not list the loopback pseudo-interface at all, so there is
+ * nothing to exclude here; the filter stays anyway, because a machine with a
+ * loopback adapter that *is* listed would otherwise count a local publisher's
+ * traffic as fleet traffic.
+ */
+export function parseNetAdapterStatistics(text: string): NetworkCounters | undefined {
+  let rxBytes = 0;
+  let txBytes = 0;
+  let interfaces = 0;
+  for (const line of text.split('\n')) {
+    const fields = line.trim().split('|');
+    if (fields.length < 3) {
+      continue;
+    }
+    const name = (fields[0] as string).trim();
+    if (name === '' || /loopback/i.test(name)) {
+      continue;
+    }
+    const rx = Number(fields[1]);
+    const tx = Number(fields[2]);
+    if (!Number.isFinite(rx) || !Number.isFinite(tx)) {
+      continue;
+    }
+    rxBytes += rx;
+    txBytes += tx;
+    interfaces += 1;
+  }
+  return interfaces === 0 ? undefined : { rxBytes, txBytes };
+}
+
 export async function readNetworkCounters(): Promise<NetworkCounters | undefined> {
   if (process.platform === 'linux') {
     try {
@@ -280,6 +369,14 @@ export async function readNetworkCounters(): Promise<NetworkCounters | undefined
     } catch {
       return undefined;
     }
+  }
+  if (process.platform === 'win32') {
+    const stdout = await powershell(
+      "Get-NetAdapterStatistics | ForEach-Object { $_.Name + '|' + " +
+        "$_.ReceivedBytes.ToString([cultureinfo]::InvariantCulture) + '|' + " +
+        '$_.SentBytes.ToString([cultureinfo]::InvariantCulture) }',
+    );
+    return stdout === undefined ? undefined : parseNetAdapterStatistics(stdout);
   }
   const stdout = await run('netstat', ['-ibn']);
   return stdout === undefined ? undefined : parseNetstatInterfaces(stdout);
